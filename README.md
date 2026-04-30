@@ -4,6 +4,72 @@ Daily home-run prop intelligence: Statcast metrics, zone-fit scoring, recent for
 park factors, and weather, weighted into a Kasper-style heat-mapped table for every
 starter in today's MLB slate.
 
+## Zone Fit methodology (v0.3 — Option B)
+
+The `zone_fit` score is a 0–100 blend of three components:
+
+**1. Quality-of-contact overlap (40%)** — batter's xwOBA-by-zone weighted by where
+the pitcher actually throws. Uses pitch-type-specific zone profiles for the
+pitcher's top 3 pitches, weighted by usage (`pitch_mix`). Falls back to combined
+zone profile when pitch-type data is thin.
+
+**2. Swing-discipline edge (30%)** — rewards in-zone aggression (`z_swing_rate`,
+how often the batter swings at strikes) and penalizes chase rate (`o_swing_rate`,
+how often the batter swings at balls). Aggressive in-zone hitters with low chase
+rates get the edge.
+
+**3. Heart vs edge (30%)** — pitchers who paint edges are hard to barrel; pitchers
+living in the middle of the plate (`heart_pct`, zone 5) are HR fodder. Combines
+`heart_pct` (positive signal for HR) and `edge_pct` (negative signal).
+
+Calibrated so league-average matchups land near 50, elite-batter-vs-meatball
+reaches 70+, and weak-batter-vs-ace lands below 25.
+
+## Form v2 — multi-component "is this batter hot?" score
+
+The `form_score` (0-100) replaces the legacy single-signal barrel-rate trend.
+Compares recent ~25 batted balls against a baseline using a hybrid framing:
+
+- **Baseline = full season** when batter has ≥50 BBE this year
+- **Baseline = prior-window within 30-day pull** as fallback (early season)
+- **Baseline = none → form_score 50** when even fallback is too thin
+
+Score is a weighted blend of five trend components:
+
+| Component | Weight | Why |
+|---|---|---|
+| Barrel rate trend | 35% | Most predictive of HR upside |
+| xwOBA-on-contact trend | 25% | Squaring up the ball |
+| Hard-hit rate trend | 15% | Adjacent to barrels |
+| Bat speed trend | 10% | When available, signals locked-in |
+| HR count recency | 15% | Lagging signal — weighted small on purpose |
+
+Each component normalized so 50 = matches baseline, 80+ = decisively hot,
+20- = decisively cold. Arrow: up if ≥60, down if ≤40, else flat.
+
+**Why this matters:** A batter barreling 17% with .430 xwOBA-con but only 1 HR
+in his last 25 BBE rates as hot (~71) — Form v1 would have rated him meh.
+A batter with 3 cheap HRs but mediocre contact rates as neutral (~42) — Form v1
+would have ranked him highly.
+
+## Picks log — backtesting infrastructure
+
+Every daily refresh writes to `pick_snapshots`: one row per (date × player ×
+prop_type) capturing all model scores at the moment of prediction. A separate
+`outcomes` job (run late at night) populates `pick_outcomes` from MLB Stats API
+box scores.
+
+**Backtest endpoints:**
+- `GET /api/backtest/summary?days=30&prop_type=hr` — overall hit rate, broken
+  down by score tier (A/B/C/D)
+- `GET /api/backtest/component/{component}?days=30&bucket_size=10` — bucketed
+  hit-rate analysis per component. Tells you whether `form_score` 70-80
+  actually predicts more HRs than `form_score` 30-40.
+
+**Two cron entries needed on Railway/Render:**
+- `python -m app.cron`     — daily ingest + snapshot at ~10am ET
+- `python -m app.outcomes` — outcomes recording at ~2am ET (catches yesterday)
+
 ## What it shows
 
 **Hitter table** (heat-mapped, sortable, per-game tabs):
@@ -122,4 +188,3 @@ curl http://localhost:8000/api/slate
 - **MLB Stats API lineups are projected pre-game.** They flip to confirmed ~30
   minutes before first pitch. Your second cron run should capture the confirmed set.
 - **Reminder:** Cross-reference with PropFinder before placing any picks.
-# ballparkStats

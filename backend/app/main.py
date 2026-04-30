@@ -7,6 +7,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers.slate import router as slate_router
+from app.routers.backtest import router as backtest_router
 from app.database import init_db
 
 app = FastAPI(title="Parkblast HR API", version="0.1.0")
@@ -22,6 +23,7 @@ app.add_middleware(
 )
 
 app.include_router(slate_router)
+app.include_router(backtest_router)
 
 
 @app.on_event("startup")

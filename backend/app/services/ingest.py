@@ -174,6 +174,50 @@ def _hot_zones(df: pd.DataFrame) -> list[list[float]]:
     return [[round(v / total * 100, 1) for v in row] for row in grid]
 
 
+def _woba_zones(df: pd.DataFrame) -> list[list[float]]:
+    """
+    3x3 grid of batter's xwOBA on pitches in each zone.
+    Uses estimated_woba_using_speedangle. Falls back to 0.320 (league avg)
+    when a zone has fewer than 8 pitches (sample too thin to trust).
+    """
+    grid = [[0.320] * 3 for _ in range(3)]
+    if "zone" not in df.columns or "estimated_woba_using_speedangle" not in df.columns:
+        return grid
+    in_zone = df[df["zone"].between(1, 9)]
+    if in_zone.empty:
+        return grid
+    # Aggregate by zone using PA-ending events only (events column non-null)
+    plate_app = in_zone[in_zone["events"].notna()]
+    for z in range(1, 10):
+        cell = plate_app[plate_app["zone"] == z]
+        if len(cell) >= 8:
+            v = cell["estimated_woba_using_speedangle"].mean()
+            if not pd.isna(v):
+                r, c = (z - 1) // 3, (z - 1) % 3
+                grid[r][c] = round(float(v), 3)
+    return grid
+
+
+def _swing_rates(df: pd.DataFrame) -> tuple[float, float]:
+    """
+    Returns (z_swing_rate, o_swing_rate) as percentages.
+    Z = zones 1-9 (in strike zone). O = zones 11-14 (just outside).
+    """
+    if "zone" not in df.columns or "description" not in df.columns:
+        return 67.0, 28.0  # league averages
+
+    swing_descs = {
+        "swinging_strike", "swinging_strike_blocked", "foul", "foul_tip",
+        "hit_into_play", "hit_into_play_no_out", "hit_into_play_score",
+    }
+    df_z = df[df["zone"].between(1, 9)]
+    df_o = df[df["zone"].between(11, 14)]
+
+    z_swing = (df_z["description"].isin(swing_descs).sum() / len(df_z) * 100) if len(df_z) else 67.0
+    o_swing = (df_o["description"].isin(swing_descs).sum() / len(df_o) * 100) if len(df_o) else 28.0
+    return round(float(z_swing), 1), round(float(o_swing), 1)
+
+
 def _pitcher_zone_profile(df: pd.DataFrame) -> list[list[float]]:
     if df.empty:
         return [[11.1] * 3 for _ in range(3)]
@@ -187,14 +231,126 @@ def _pitcher_zone_profile(df: pd.DataFrame) -> list[list[float]]:
     return grid
 
 
+def _pitcher_zone_profile_by_pitch_type(df: pd.DataFrame, top_n: int = 3) -> dict:
+    """
+    Per-pitch-type 3x3 zone profile for the pitcher's top N pitch types.
+    Returns {"FF": [[...], [...], [...]], "SL": ...} keyed by pitch_type code.
+    """
+    if df.empty or "pitch_type" not in df.columns or "zone" not in df.columns:
+        return {}
+    top_types = df["pitch_type"].value_counts().head(top_n).index.tolist()
+    out = {}
+    for pt in top_types:
+        if pd.isna(pt):
+            continue
+        subset = df[df["pitch_type"] == pt]
+        out[str(pt)] = _pitcher_zone_profile(subset)
+    return out
+
+
+def _edge_and_heart_pct(df: pd.DataFrame) -> tuple[float, float]:
+    """
+    Edge% = pitches in zones 1, 3, 7, 9 (in-zone corners) + 11-14 (just-off-plate).
+    Heart% = pitches in zone 5 (middle-middle).
+    """
+    if df.empty or "zone" not in df.columns:
+        return 38.0, 12.0
+    total = len(df)
+    edge_zones = {1, 3, 7, 9, 11, 12, 13, 14}
+    edge_cnt = df["zone"].isin(edge_zones).sum()
+    heart_cnt = (df["zone"] == 5).sum()
+    return (
+        round(float(edge_cnt / total * 100), 1) if total else 38.0,
+        round(float(heart_cnt / total * 100), 1) if total else 12.0,
+    )
+
+
 def _hr_form_pct_and_arrow(df: pd.DataFrame) -> tuple[float, str]:
     """
+    LEGACY display metric — kept for backwards compat in API payload.
+    Form v2 (`_compute_form_v2_inputs`) is what actually drives ranking.
+
     HR Form % — share of recent batted balls that have HR-shaped contact
     (barrels). Arrow compares last-15-day rate to the prior 15.
     """
     bbe = df[df["type"] == "X"]
     if bbe.empty:
         return 0.0, "flat"
+
+
+def _bbe_metrics(bbe: pd.DataFrame, hrs_count: int = None) -> dict:
+    """Compute the five Form v2 metric values from a batted-balls dataframe."""
+    if bbe is None or bbe.empty:
+        return {}
+    n = len(bbe)
+    barrel_rate = (bbe["launch_speed_angle"].eq(6).sum() / n * 100) if "launch_speed_angle" in bbe.columns else None
+    hard_hit = ((bbe["launch_speed"] >= 95).sum() / n * 100) if "launch_speed" in bbe.columns else None
+    xwoba_con = float(bbe["estimated_woba_using_speedangle"].mean()) if "estimated_woba_using_speedangle" in bbe.columns else None
+    if xwoba_con is not None and pd.isna(xwoba_con):
+        xwoba_con = None
+    bat_speed = None
+    if "bat_speed" in bbe.columns:
+        v = bbe["bat_speed"].mean()
+        bat_speed = float(v) if not pd.isna(v) else None
+    if hrs_count is None:
+        hrs_count = int((bbe["events"] == "home_run").sum()) if "events" in bbe.columns else 0
+    hr_per_bbe = hrs_count / n if n else 0.0
+    return {
+        "barrel_rate": barrel_rate,
+        "hard_hit_rate": hard_hit,
+        "xwoba_con": xwoba_con,
+        "bat_speed": bat_speed,
+        "hr_per_bbe": hr_per_bbe,
+    }
+
+
+def _recent_window(df: pd.DataFrame, n_bbe_target: int = 25) -> pd.DataFrame:
+    """
+    Return the most-recent N batted balls in play.
+    Sorted by game_date descending, then take first N rows of BIP.
+    """
+    if df.empty:
+        return df
+    bbe = df[df["type"] == "X"].copy()
+    if bbe.empty:
+        return bbe
+    bbe = bbe.sort_values("game_date", ascending=False)
+    return bbe.head(n_bbe_target)
+
+
+def _prior_window(df: pd.DataFrame, recent_n: int = 25) -> pd.DataFrame:
+    """Batted balls older than the recent window — used as fallback baseline."""
+    if df.empty:
+        return df
+    bbe = df[df["type"] == "X"].copy()
+    if bbe.empty or len(bbe) <= recent_n:
+        return bbe.iloc[0:0]  # empty
+    bbe = bbe.sort_values("game_date", ascending=False)
+    return bbe.iloc[recent_n:]
+
+
+def fetch_season_baseline(mlbam_id: int) -> Optional[dict]:
+    """
+    Pull season-to-date Statcast for this batter and compute baseline metrics.
+    Returns None if season sample is too thin (<50 BBE).
+
+    Cached by pybaseball, so subsequent calls in the same day are cheap.
+    """
+    today = date.today()
+    season_start = date(today.year, 3, 15)  # pre-season + spring
+    if today <= season_start:
+        return None
+    try:
+        df = pybaseball.statcast_batter(season_start.isoformat(), today.isoformat(), mlbam_id)
+    except Exception as e:
+        logger.warning(f"season baseline fetch failed for {mlbam_id}: {e}")
+        return None
+    if df.empty:
+        return None
+    bbe = df[df["type"] == "X"]
+    if len(bbe) < 50:
+        return None
+    return _bbe_metrics(bbe)
     # Recent vs prior split
     end = pd.to_datetime(df["game_date"]).max()
     if pd.isna(end):
@@ -314,6 +470,36 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
 
     khr = compute_khr(barrel_pct, swstr_pct, hard_hit_pct, sweet_spot_pct)
 
+    # Option-B zone_fit inputs
+    woba_zones = _woba_zones(df)
+    z_swing_rate, o_swing_rate = _swing_rates(df)
+
+    # Form v2 — recent vs baseline comparison (hybrid framing)
+    recent_bbe = _recent_window(df, n_bbe_target=25)
+    recent_metrics = _bbe_metrics(recent_bbe)
+
+    # Try season baseline first; fall back to prior-window within 30-day pull
+    season_baseline = fetch_season_baseline(mlbam_id) if len(recent_bbe) >= 8 else None
+    if season_baseline:
+        baseline_metrics = season_baseline
+        baseline_source = "season"
+    else:
+        prior_bbe = _prior_window(df, recent_n=25)
+        if len(prior_bbe) >= 15:
+            baseline_metrics = _bbe_metrics(prior_bbe)
+            baseline_source = "prior"
+        else:
+            baseline_metrics = {}
+            baseline_source = "none"
+
+    if baseline_source == "none" or not recent_metrics:
+        # Not enough data — neutral form
+        form_v2 = {"form_score": 50.0, "form_arrow": "flat",
+                   "form_breakdown": {}, "baseline_source": "none"}
+    else:
+        from app.services.scoring import compute_form_v2
+        form_v2 = compute_form_v2(recent_metrics, baseline_metrics, baseline_source)
+
     stats = BatterStats(
         mlbam_id=mlbam_id,
         as_of=end,
@@ -336,6 +522,15 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
         hr_total=len(hrs),
         khr=round(khr, 1),
         hot_zones=_hot_zones(df),
+        woba_zones=woba_zones,
+        z_swing_rate=z_swing_rate,
+        o_swing_rate=o_swing_rate,
+        # Form v2
+        form_score=form_v2["form_score"],
+        form_arrow=form_v2["form_arrow"],
+        form_breakdown=form_v2["form_breakdown"],
+        baseline_source=form_v2["baseline_source"],
+        # Legacy form fields (still populated for backwards compat)
         hr_l7=_hrs_in_window(7),
         hr_l15=_hrs_in_window(15),
         hr_l30=_hrs_in_window(30),
@@ -394,6 +589,10 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
     # SIERA — best from pybaseball seasonal leaderboard, fall back to estimate
     siera = 4.5  # neutral fallback; ideally fetched from pitching_stats() yearly cache
 
+    # Option-B zone_fit inputs (pitcher side)
+    zone_by_type = _pitcher_zone_profile_by_pitch_type(df, top_n=3)
+    edge_pct, heart_pct = _edge_and_heart_pct(df)
+
     pitcher_obj = type("P", (), {
         "csw_rate": csw_rate,
         "swstr_rate": swstr_rate,
@@ -424,6 +623,9 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
         barrel_per_bip=round(brl_bip, 1),
         pitch_mix=pitch_mix,
         zone_profile=_pitcher_zone_profile(df),
+        zone_profile_by_pitch_type=zone_by_type,
+        edge_pct=edge_pct,
+        heart_pct=heart_pct,
     )
     db.merge(stats)
     db.commit()
@@ -495,5 +697,9 @@ async def run_daily_refresh(db: Session):
             if game_row:
                 game_row.weather_data = wx
     db.commit()
+
+    # Snapshot today's picks for backtesting
+    from app.services.picks_log import snapshot_daily_picks
+    snapshot_daily_picks(db)
 
     logger.info("Daily refresh complete")

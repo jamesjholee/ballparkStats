@@ -23,24 +23,183 @@ WEIGHTS = {
 }
 
 
-def compute_zone_fit(hot_zones, pitcher_profile) -> float:
-    """Dot product of batter HR-zone distribution × pitcher location distribution."""
-    if not hot_zones or not pitcher_profile:
-        return 0.0
-    fit = 0.0
+def compute_zone_fit(batter, pitcher) -> float:
+    """
+    Three-component zone-fit score (0-100).
+
+    1. Quality-of-contact overlap (40%) — batter's xwOBA-by-zone × pitcher's
+       location density. If the batter crushes pitches in zones the pitcher
+       lives in, score is high. (When pitch-type-specific zones are available,
+       average across the pitcher's top pitches weighted by usage.)
+
+    2. Swing-discipline edge (30%) — does the batter swing at zones the pitcher
+       attacks (good fit), and avoid chasing what's off the plate (good plate
+       discipline = harder for pitcher to manage).
+
+    3. Heart vs edge (30%) — pitchers who paint edges are hard to barrel;
+       pitchers living in the heart of the plate are HR fodder.
+
+    Falls back gracefully when any input is missing.
+    """
+    # --- Component 1: Quality-of-contact overlap ---
+    woba_zones = getattr(batter, "woba_zones", None) or [[0.320] * 3 for _ in range(3)]
+    zone_by_type = getattr(pitcher, "zone_profile_by_pitch_type", None) if pitcher else None
+    pitch_mix = (pitcher.pitch_mix if pitcher and pitcher.pitch_mix else {}) or {}
+    fallback_zones = (pitcher.zone_profile if pitcher else None) or [[11.1] * 3 for _ in range(3)]
+
+    # Build effective pitcher zone density: weighted average across top pitch types
+    if zone_by_type and pitch_mix:
+        eff_zones = [[0.0] * 3 for _ in range(3)]
+        total_w = 0.0
+        for pt, grid in zone_by_type.items():
+            w = pitch_mix.get(pt, 0)
+            if w <= 0 or not grid:
+                continue
+            for i in range(3):
+                for j in range(3):
+                    eff_zones[i][j] += grid[i][j] * w
+            total_w += w
+        if total_w > 0:
+            eff_zones = [[v / total_w for v in row] for row in eff_zones]
+        else:
+            eff_zones = fallback_zones
+    else:
+        eff_zones = fallback_zones
+
+    # Dot product: sum (xwOBA-in-zone × pitcher-density-in-zone)
+    # eff_zones cells are in pct-of-pitches (sum to ~100 over 9 cells if all in-zone,
+    # or less if pitcher works heavily off-plate). Weighted-avg xwOBA = c1_raw / sum(density)/100.
+    weighted_woba = 0.0
+    weight_sum = 0.0
     for i in range(3):
         for j in range(3):
-            fit += (hot_zones[i][j] / 100) * (pitcher_profile[i][j] / 100)
-    return min(100, fit * 1400)
+            woba = woba_zones[i][j] or 0.320
+            density = eff_zones[i][j] / 100
+            weighted_woba += woba * density
+            weight_sum += density
+    if weight_sum > 0:
+        c1_raw = weighted_woba / weight_sum  # batter's xwOBA weighted by where pitcher throws
+    else:
+        c1_raw = 0.320
+    # Map .200 → 0, .320 → 50, .440 → 100 (each .024 of xwOBA = 10 points)
+    c1 = max(0.0, min(100.0, (c1_raw - 0.200) * 417))
+
+    # --- Component 2: Swing-discipline edge ---
+    z_swing = getattr(batter, "z_swing_rate", None)
+    o_swing = getattr(batter, "o_swing_rate", None)
+    if z_swing is None or o_swing is None:
+        c2 = 50.0
+    else:
+        # Reward in-zone aggression (good batters swing at hittable pitches)
+        # Penalize chase rate (chasers get exploited)
+        # League avg z-swing ~67%, o-swing ~28%
+        z_score = max(0, min(100, (z_swing - 50) * 2.5))
+        o_score = max(0, min(100, (40 - o_swing) * 3))   # lower chase = higher score
+        c2 = 0.6 * z_score + 0.4 * o_score
+
+    # --- Component 3: Heart vs edge ---
+    if pitcher is None:
+        c3 = 50.0
+    else:
+        heart = pitcher.heart_pct if pitcher.heart_pct is not None else 12.0
+        edge = pitcher.edge_pct if pitcher.edge_pct is not None else 38.0
+        # League: heart ~12%, edge ~38%. Map heart 4→0, 12→50, 20→100. Edge 25→100, 50→0.
+        heart_score = max(0, min(100, (heart - 4) * 6.25))
+        edge_score = max(0, min(100, 100 - (edge - 25) * 4))
+        # Heart density is the stronger HR signal — weight it more
+        c3 = 0.65 * heart_score + 0.35 * edge_score
+
+    # Final blend
+    fit = 0.4 * c1 + 0.3 * c2 + 0.3 * c3
+    return round(max(0.0, min(100.0, fit)), 2)
 
 
 def compute_form_score(hr_l7, hr_l15, hr_l30) -> float:
-    """Recency-weighted form score 0-100."""
+    """
+    LEGACY recency-weighted form score 0-100. Kept for backwards compat
+    with any caller still using it. Form v2 supersedes this.
+    """
     w7 = ((hr_l7 or 0) / 7) * 100 * 4
     w15 = ((hr_l15 or 0) / 15) * 100 * 2
     w30 = ((hr_l30 or 0) / 30) * 100
     raw = (w7 + w15 + w30) / 7
     return max(0, min(100, raw * 18))
+
+
+def _z_to_score(z: float) -> float:
+    """
+    Convert a z-score (recent vs baseline, in std-devs) to a 0-100 form scale.
+    z = 0 → 50 (matches baseline)
+    z = +1.5 → ~85 (decisively hot)
+    z = -1.5 → ~15 (decisively cold)
+    Clipped at 0 and 100.
+    """
+    return max(0.0, min(100.0, 50.0 + z * 23.0))
+
+
+def _trend_component(recent_val, baseline_val, typical_std) -> float:
+    """One metric's contribution. Returns 0-100 where 50 = matches baseline."""
+    if recent_val is None or baseline_val is None or typical_std <= 0:
+        return 50.0
+    z = (recent_val - baseline_val) / typical_std
+    return _z_to_score(z)
+
+
+def compute_form_v2(recent: dict, baseline: dict, baseline_source: str) -> dict:
+    """
+    Form v2 — multi-component "is this batter hot?" score.
+
+    Compares recent (~25 BBE) performance against baseline (full season or
+    prior-20 fallback). Returns 0-100 score, up/down/flat arrow, and a
+    component breakdown for explainability.
+
+    Inputs are dicts with keys: barrel_rate, xwoba_con, hard_hit_rate,
+    bat_speed, hr_per_bbe. Any missing key falls back to neutral.
+
+    `typical_std` values are league-wide standard deviations of these stats
+    over a 25-BBE window — i.e., "how much does this stat normally fluctuate
+    just from random sample variation?" Hardcoded from Statcast research.
+    """
+    # League-wide standard deviations over a ~25-BBE window
+    STD = {
+        "barrel_rate":     5.0,    # percentage points
+        "xwoba_con":       0.060,  # xwOBA points
+        "hard_hit_rate":   8.0,    # percentage points
+        "bat_speed":       1.2,    # mph
+        "hr_per_bbe":      0.04,   # rate (4 percentage points)
+    }
+
+    components = {
+        "barrel_trend":    _trend_component(recent.get("barrel_rate"), baseline.get("barrel_rate"), STD["barrel_rate"]),
+        "xwoba_con_trend": _trend_component(recent.get("xwoba_con"),   baseline.get("xwoba_con"),   STD["xwoba_con"]),
+        "hard_hit_trend":  _trend_component(recent.get("hard_hit_rate"), baseline.get("hard_hit_rate"), STD["hard_hit_rate"]),
+        "bat_speed_trend": _trend_component(recent.get("bat_speed"),   baseline.get("bat_speed"),   STD["bat_speed"]),
+        "hr_recency":      _trend_component(recent.get("hr_per_bbe"),  baseline.get("hr_per_bbe"),  STD["hr_per_bbe"]),
+    }
+
+    weights = {
+        "barrel_trend":    0.35,
+        "xwoba_con_trend": 0.25,
+        "hard_hit_trend":  0.15,
+        "bat_speed_trend": 0.10,
+        "hr_recency":      0.15,
+    }
+
+    score = sum(components[k] * weights[k] for k in weights)
+
+    if score >= 60:
+        arrow = "up"
+    elif score <= 40:
+        arrow = "down"
+    else:
+        arrow = "flat"
+
+    return {
+        "form_score": round(score, 1),
+        "form_arrow": arrow,
+        "form_breakdown": {k: round(v, 1) for k, v in components.items()},
+        "baseline_source": baseline_source,
+    }
 
 
 def compute_weather_score(wx) -> float:
@@ -110,13 +269,12 @@ def score_batter(batter, pitcher, team_code: str, weather: Optional[dict]) -> di
     barrel = batter.barrel_rate or 0
     exit_velo = batter.avg_exit_velo or 0
     bat_speed = batter.bat_speed or 0
-    hot_zones = batter.hot_zones or [[11.1] * 3 for _ in range(3)]
-    pitcher_profile = pitcher.zone_profile if pitcher else [[11.1] * 3 for _ in range(3)]
     pitcher_hr9 = pitcher.hr_per_9 if pitcher else 1.2
 
     park_factor = PARK_HR_FACTORS.get(team_code, 100)
-    zone_fit = compute_zone_fit(hot_zones, pitcher_profile)
-    form_score = compute_form_score(batter.hr_l7, batter.hr_l15, batter.hr_l30)
+    zone_fit = compute_zone_fit(batter, pitcher)
+    # Use Form v2 score from BatterStats (computed during ingest); fallback for safety
+    form_score = batter.form_score if batter.form_score is not None else compute_form_score(batter.hr_l7, batter.hr_l15, batter.hr_l30)
     weather_score = compute_weather_score(weather)
 
     norm = {

@@ -42,7 +42,12 @@ def _serialize_batter_row(entry, batter, batter_meta, opp_pitcher, game, weather
         "test_score": score["test_score"],
         "ceiling": score["ceiling"],
         "zone_fit": score["zone_fit"],
-        # Form
+        # Form v2
+        "form_score": batter.form_score,
+        "form_arrow": batter.form_arrow,
+        "form_breakdown": batter.form_breakdown,
+        "baseline_source": batter.baseline_source,
+        # Legacy form (kept for backwards compat)
         "hr_form_pct": batter.hr_form_pct,
         "hr_form_arrow": batter.hr_form_arrow,
         # Statcast

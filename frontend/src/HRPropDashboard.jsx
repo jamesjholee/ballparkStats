@@ -47,7 +47,7 @@ const HITTER_COLS = [
   { key: 'test_score',        label: 'Test',          fmt: v => v?.toFixed(1),  invert: false },
   { key: 'ceiling',           label: 'Ceiling',       fmt: v => v?.toFixed(1),  invert: false },
   { key: 'zone_fit',          label: 'Zone Fit',      fmt: v => v?.toFixed(2),  invert: false },
-  { key: 'hr_form_pct',       label: 'Form',          fmt: 'form',              invert: false },
+  { key: 'form_score',        label: 'Form',          fmt: 'form',              invert: false },
   { key: 'khr',               label: 'kHR',           fmt: v => v?.toFixed(1),  invert: false },
   { key: 'pitches',           label: 'Pitches',       fmt: v => v?.toLocaleString(), invert: false, neutral: true },
   { key: 'bip',               label: 'BIP',           fmt: v => v?.toLocaleString(), invert: false, neutral: true },
@@ -98,7 +98,7 @@ function FormCell({ value, arrow }) {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color }}>
       <Icon size={11} strokeWidth={2.5} />
-      <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }}>{value?.toFixed(1)}%</span>
+      <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }}>{value != null ? value.toFixed(0) : '–'}</span>
     </span>
   );
 }
@@ -280,7 +280,7 @@ function HitterTable({ rows, defaultSort = 'khr' }) {
                 {HITTER_COLS.map(c => {
                   let display, bg;
                   if (c.fmt === 'form') {
-                    display = <FormCell value={row.hr_form_pct} arrow={row.hr_form_arrow} />;
+                    display = <FormCell value={row.form_score} arrow={row.form_arrow} />;
                     bg = 'transparent';
                   } else {
                     const v = row[c.key];
