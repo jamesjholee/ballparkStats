@@ -1,0 +1,64 @@
+"""
+Static reference data — park factors and stadium coordinates.
+Park factors sourced from FanGraphs HR factors (3-year rolling).
+Coordinates used to fetch ballpark-specific weather.
+Update these values yearly from https://www.fangraphs.com/guts.aspx?type=pf
+"""
+
+# 100 = neutral; >100 favors HRs, <100 suppresses
+PARK_HR_FACTORS = {
+    "ARI": 102, "ATL": 105, "BAL": 99,  "BOS": 96,  "CHC": 100,
+    "CHW": 109, "CIN": 116, "CLE": 95,  "COL": 128, "DET": 95,
+    "HOU": 101, "KC":  97,  "LAA": 98,  "LAD": 105, "MIA": 88,
+    "MIL": 104, "MIN": 102, "NYM": 96,  "NYY": 117, "OAK": 92,
+    "PHI": 112, "PIT": 96,  "SD":  95,  "SEA": 92,  "SF":  85,
+    "STL": 96,  "TB":  92,  "TEX": 109, "TOR": 109, "WSH": 100,
+    "ATH": 92,  # Athletics in Sacramento (2025+)
+}
+
+# (lat, lon, park_name)
+STADIUM_COORDS = {
+    "ARI": (33.4453, -112.0667, "Chase Field"),
+    "ATL": (33.8908, -84.4678, "Truist Park"),
+    "BAL": (39.2839, -76.6217, "Camden Yards"),
+    "BOS": (42.3467, -71.0972, "Fenway Park"),
+    "CHC": (41.9484, -87.6553, "Wrigley Field"),
+    "CHW": (41.83,   -87.6339, "Guaranteed Rate Field"),
+    "CIN": (39.0975, -84.5069, "Great American Ball Park"),
+    "CLE": (41.4962, -81.6852, "Progressive Field"),
+    "COL": (39.7561, -104.9942, "Coors Field"),
+    "DET": (42.339,  -83.0485, "Comerica Park"),
+    "HOU": (29.7572, -95.3556, "Minute Maid Park"),
+    "KC":  (39.0517, -94.4803, "Kauffman Stadium"),
+    "LAA": (33.8003, -117.8827, "Angel Stadium"),
+    "LAD": (34.0739, -118.24, "Dodger Stadium"),
+    "MIA": (25.7781, -80.2197, "loanDepot park"),
+    "MIL": (43.0281, -87.9712, "American Family Field"),
+    "MIN": (44.9817, -93.2778, "Target Field"),
+    "NYM": (40.7571, -73.8458, "Citi Field"),
+    "NYY": (40.8296, -73.9262, "Yankee Stadium"),
+    "OAK": (37.7516, -122.2005, "Oakland Coliseum"),
+    "PHI": (39.9061, -75.1665, "Citizens Bank Park"),
+    "PIT": (40.4469, -80.0057, "PNC Park"),
+    "SD":  (32.7073, -117.157, "Petco Park"),
+    "SEA": (47.5914, -122.3325, "T-Mobile Park"),
+    "SF":  (37.7786, -122.3893, "Oracle Park"),
+    "STL": (38.6226, -90.1928, "Busch Stadium"),
+    "TB":  (27.7682, -82.6534, "Tropicana Field"),
+    "TEX": (32.7473, -97.0817, "Globe Life Field"),
+    "TOR": (43.6414, -79.3894, "Rogers Centre"),
+    "WSH": (38.873,  -77.0074, "Nationals Park"),
+    "ATH": (38.5806, -121.5132, "Sutter Health Park"),
+}
+
+# Park orientation — degrees from home plate to CF (for wind direction interpretation)
+# Used to translate compass wind direction into "out to LF/CF/RF"
+PARK_CF_BEARING = {
+    "ARI": 23, "ATL": 51, "BAL": 32, "BOS": 45, "CHC": 33,
+    "CHW": 41, "CIN": 32, "CLE": 0,  "COL": 0,  "DET": 25,
+    "HOU": 19, "KC":  45, "LAA": 50, "LAD": 26, "MIA": 39,
+    "MIL": 30, "MIN": 90, "NYM": 25, "NYY": 75, "OAK": 60,
+    "PHI": 20, "PIT": 119,"SD":  9,  "SEA": 45, "SF":  91,
+    "STL": 60, "TB":  45, "TEX": 19, "TOR": 0,  "WSH": 30,
+    "ATH": 45,
+}
