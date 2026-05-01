@@ -4,14 +4,16 @@ API routes — Kasper-style payload, grouped by game.
 GET /api/slate           -> top-level slate summary + games list + top hitters/pitchers
 GET /api/games/{game_pk} -> per-game detail: hitters table (away+home), pitcher table
 """
+
 from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.database import get_db
-from app.models.db import Game, Lineup, BatterStats, PitcherStats, Player
-from app.services.scoring import score_batter
 from app.constants import STADIUM_COORDS
+from app.database import get_db
+from app.models.db import BatterStats, Game, Lineup, PitcherStats, Player
+from app.services.scoring import score_batter
 
 router = APIRouter()
 
@@ -29,6 +31,15 @@ def _serialize_batter_row(entry, batter, batter_meta, opp_pitcher, game, weather
         team_code=game.venue,
         weather=weather,
     )
+    # lineup_status: "confirmed" if MLB has posted lineup with this player,
+    # "bench" if rostered but not in lineup, "projected" if order set without confirmation
+    if entry.confirmed:
+        lineup_status = "confirmed"
+    elif entry.batting_order is not None:
+        lineup_status = "projected"
+    else:
+        lineup_status = "bench"
+
     return {
         "id": entry.batter_id,
         "name": batter_meta.full_name if batter_meta else f"#{entry.batter_id}",
@@ -36,6 +47,7 @@ def _serialize_batter_row(entry, batter, batter_meta, opp_pitcher, game, weather
         "pos": batter_meta.position if batter_meta else "?",
         "bats": batter_meta.bats if batter_meta else "?",
         "batting_order": entry.batting_order,
+        "lineup_status": lineup_status,
         "sample_tier": batter.sample_tier or "thin",
         # Headline scores
         "matchup": score["matchup"],
@@ -77,6 +89,7 @@ def _serialize_batter_row(entry, batter, batter_meta, opp_pitcher, game, weather
 def _serialize_pitcher_row(pitcher, pitcher_meta, game, opponent_team):
     """Pitcher table row."""
     from app.services.scoring import compute_pitcher_tier
+
     tier = compute_pitcher_tier(pitcher.pitch_score, pitcher.hr_per_9)
     return {
         "id": pitcher.mlbam_id,
@@ -113,7 +126,12 @@ def get_slate(db: Session = Depends(get_db)):
     today = date.today()
     games = db.query(Game).filter(Game.game_date == today).all()
     if not games:
-        return {"date": today.isoformat(), "games": [], "top_hitters": [], "top_pitchers": []}
+        return {
+            "date": today.isoformat(),
+            "games": [],
+            "top_hitters": [],
+            "top_pitchers": [],
+        }
 
     games_payload = []
     all_hitters = []
@@ -121,16 +139,18 @@ def get_slate(db: Session = Depends(get_db)):
 
     for game in games:
         _, _, park_name = STADIUM_COORDS.get(game.venue, (0, 0, "Unknown"))
-        games_payload.append({
-            "game_pk": game.game_pk,
-            "game_time_utc": game.game_time_utc,
-            "home_team": game.home_team,
-            "away_team": game.away_team,
-            "venue": game.venue,
-            "park_name": park_name,
-            "status": game.status,
-            "weather": game.weather_data or {},
-        })
+        games_payload.append(
+            {
+                "game_pk": game.game_pk,
+                "game_time_utc": game.game_time_utc,
+                "home_team": game.home_team,
+                "away_team": game.away_team,
+                "venue": game.venue,
+                "park_name": park_name,
+                "status": game.status,
+                "weather": game.weather_data or {},
+            }
+        )
 
         # Build hitter rows for this game
         for team_code, opp_pitcher_id in [
@@ -138,16 +158,20 @@ def get_slate(db: Session = Depends(get_db)):
             (game.away_team, game.home_pitcher_id),
         ]:
             opp_pitcher = (
-                db.query(PitcherStats)
-                .filter(PitcherStats.mlbam_id == opp_pitcher_id)
-                .order_by(PitcherStats.as_of.desc())
-                .first()
-            ) if opp_pitcher_id else None
+                (
+                    db.query(PitcherStats)
+                    .filter(PitcherStats.mlbam_id == opp_pitcher_id)
+                    .order_by(PitcherStats.as_of.desc())
+                    .first()
+                )
+                if opp_pitcher_id
+                else None
+            )
 
             lineup = (
                 db.query(Lineup)
                 .filter(Lineup.game_pk == game.game_pk, Lineup.team == team_code)
-                .order_by(Lineup.batting_order)
+                .order_by(Lineup.batting_order.is_(None), Lineup.batting_order)
                 .all()
             )
             for entry in lineup:
@@ -159,8 +183,12 @@ def get_slate(db: Session = Depends(get_db)):
                 )
                 if not batter:
                     continue
-                batter_meta = db.query(Player).filter(Player.mlbam_id == entry.batter_id).first()
-                row = _serialize_batter_row(entry, batter, batter_meta, opp_pitcher, game, game.weather_data)
+                batter_meta = (
+                    db.query(Player).filter(Player.mlbam_id == entry.batter_id).first()
+                )
+                row = _serialize_batter_row(
+                    entry, batter, batter_meta, opp_pitcher, game, game.weather_data
+                )
                 row["game_pk"] = game.game_pk
                 all_hitters.append(row)
 
@@ -206,32 +234,42 @@ def get_game(game_pk: int, db: Session = Depends(get_db)):
     _, _, park_name = STADIUM_COORDS.get(game.venue, (0, 0, "Unknown"))
 
     away_pitcher = (
-        db.query(PitcherStats)
-        .filter(PitcherStats.mlbam_id == game.away_pitcher_id)
-        .order_by(PitcherStats.as_of.desc())
-        .first()
-    ) if game.away_pitcher_id else None
+        (
+            db.query(PitcherStats)
+            .filter(PitcherStats.mlbam_id == game.away_pitcher_id)
+            .order_by(PitcherStats.as_of.desc())
+            .first()
+        )
+        if game.away_pitcher_id
+        else None
+    )
     home_pitcher = (
-        db.query(PitcherStats)
-        .filter(PitcherStats.mlbam_id == game.home_pitcher_id)
-        .order_by(PitcherStats.as_of.desc())
-        .first()
-    ) if game.home_pitcher_id else None
+        (
+            db.query(PitcherStats)
+            .filter(PitcherStats.mlbam_id == game.home_pitcher_id)
+            .order_by(PitcherStats.as_of.desc())
+            .first()
+        )
+        if game.home_pitcher_id
+        else None
+    )
 
     away_pitcher_meta = (
         db.query(Player).filter(Player.mlbam_id == game.away_pitcher_id).first()
-        if game.away_pitcher_id else None
+        if game.away_pitcher_id
+        else None
     )
     home_pitcher_meta = (
         db.query(Player).filter(Player.mlbam_id == game.home_pitcher_id).first()
-        if game.home_pitcher_id else None
+        if game.home_pitcher_id
+        else None
     )
 
     def _hitters_for_team(team_code, opp_pitcher):
         lineup = (
             db.query(Lineup)
             .filter(Lineup.game_pk == game_pk, Lineup.team == team_code)
-            .order_by(Lineup.batting_order)
+            .order_by(Lineup.batting_order.is_(None), Lineup.batting_order)
             .all()
         )
         rows = []
@@ -244,8 +282,12 @@ def get_game(game_pk: int, db: Session = Depends(get_db)):
             )
             if not batter:
                 continue
-            batter_meta = db.query(Player).filter(Player.mlbam_id == entry.batter_id).first()
-            row = _serialize_batter_row(entry, batter, batter_meta, opp_pitcher, game, game.weather_data)
+            batter_meta = (
+                db.query(Player).filter(Player.mlbam_id == entry.batter_id).first()
+            )
+            row = _serialize_batter_row(
+                entry, batter, batter_meta, opp_pitcher, game, game.weather_data
+            )
             rows.append(row)
         return rows
 
@@ -262,24 +304,54 @@ def get_game(game_pk: int, db: Session = Depends(get_db)):
         "away_pitcher": (
             {
                 "name": away_pitcher_meta.full_name if away_pitcher_meta else "TBD",
-                **{k: getattr(away_pitcher, k) for k in [
-                    "throws", "pitch_score", "strikeout_score", "xwoba_against",
-                    "csw_rate", "swstr_rate", "putaway_rate", "ball_rate",
-                    "siera", "pulled_barrel_rate", "barrel_per_bip", "hr_per_9",
-                    "pitch_mix", "zone_profile",
-                ]},
-            } if away_pitcher else None
+                **{
+                    k: getattr(away_pitcher, k)
+                    for k in [
+                        "throws",
+                        "pitch_score",
+                        "strikeout_score",
+                        "xwoba_against",
+                        "csw_rate",
+                        "swstr_rate",
+                        "putaway_rate",
+                        "ball_rate",
+                        "siera",
+                        "pulled_barrel_rate",
+                        "barrel_per_bip",
+                        "hr_per_9",
+                        "pitch_mix",
+                        "zone_profile",
+                    ]
+                },
+            }
+            if away_pitcher
+            else None
         ),
         "home_pitcher": (
             {
                 "name": home_pitcher_meta.full_name if home_pitcher_meta else "TBD",
-                **{k: getattr(home_pitcher, k) for k in [
-                    "throws", "pitch_score", "strikeout_score", "xwoba_against",
-                    "csw_rate", "swstr_rate", "putaway_rate", "ball_rate",
-                    "siera", "pulled_barrel_rate", "barrel_per_bip", "hr_per_9",
-                    "pitch_mix", "zone_profile",
-                ]},
-            } if home_pitcher else None
+                **{
+                    k: getattr(home_pitcher, k)
+                    for k in [
+                        "throws",
+                        "pitch_score",
+                        "strikeout_score",
+                        "xwoba_against",
+                        "csw_rate",
+                        "swstr_rate",
+                        "putaway_rate",
+                        "ball_rate",
+                        "siera",
+                        "pulled_barrel_rate",
+                        "barrel_per_bip",
+                        "hr_per_9",
+                        "pitch_mix",
+                        "zone_profile",
+                    ]
+                },
+            }
+            if home_pitcher
+            else None
         ),
     }
 
@@ -287,5 +359,6 @@ def get_game(game_pk: int, db: Session = Depends(get_db)):
 @router.post("/api/refresh")
 async def trigger_refresh(db: Session = Depends(get_db)):
     from app.services.ingest import run_daily_refresh
+
     await run_daily_refresh(db)
     return {"status": "complete"}
