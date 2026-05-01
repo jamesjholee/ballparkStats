@@ -11,6 +11,7 @@ Computes the full Kasper-style stat set:
 
 import logging
 import os
+import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -662,8 +663,13 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
     recent_bbe = _recent_window(df, n_bbe_target=25)
     recent_metrics = _bbe_metrics(recent_bbe)
 
-    # Try season baseline first; fall back to prior-window within 30-day pull
-    season_baseline = fetch_season_baseline(mlbam_id) if len(recent_bbe) >= 8 else None
+    # Try season baseline; falls back to prior-window within the rolling pull.
+    # NOTE: Disabled for now — calling fetch_season_baseline() for every batter
+    # doubles the Statcast call volume and triggers rate limits at 400+ players.
+    # With the lookback already up to 60 days (~the season so far), the prior
+    # window inside that pull is a reasonable baseline. A separate weekly job
+    # to populate season aggregates is the proper long-term fix.
+    season_baseline = None
     if season_baseline:
         baseline_metrics = season_baseline
         baseline_source = "season"
@@ -927,10 +933,15 @@ async def run_daily_refresh(db: Session):
                 db.merge(Player(**meta))
     db.commit()
 
-    # Statcast pulls — slow
+    # Statcast pulls — slow. Throttle between calls to avoid rate-limit pauses.
+    # Baseball Savant tolerates ~1 req/sec sustained. We target 0.4s between calls
+    # which gives ~400 batters in ~3-4 min (plus the actual fetch time per call).
+    THROTTLE_SECS = 0.4
+
     n_batter_ok = 0
     n_batter_fail = 0
-    for bid in all_batter_ids:
+    total_batters = len(all_batter_ids)
+    for i, bid in enumerate(all_batter_ids, 1):
         try:
             result = refresh_batter_stats(db, bid)
             if result is not None:
@@ -938,12 +949,19 @@ async def run_daily_refresh(db: Session):
         except Exception:
             n_batter_fail += 1
             logger.exception(f"refresh_batter_stats crashed for {bid}")
-            db.rollback()  # so we can keep ingesting other batters
+            db.rollback()
+        # Progress log every 25 players so we can see it's alive
+        if i % 25 == 0:
+            logger.info(
+                f"Batter progress: {i}/{total_batters} ({n_batter_ok} ok, {n_batter_fail} failed)"
+            )
+        time.sleep(THROTTLE_SECS)
     logger.info(f"Batter ingest: {n_batter_ok} ok, {n_batter_fail} failed")
 
     n_pitcher_ok = 0
     n_pitcher_fail = 0
-    for pid in all_pitcher_ids:
+    total_pitchers = len(all_pitcher_ids)
+    for i, pid in enumerate(all_pitcher_ids, 1):
         try:
             result = refresh_pitcher_stats(db, pid)
             if result is not None:
@@ -952,6 +970,11 @@ async def run_daily_refresh(db: Session):
             n_pitcher_fail += 1
             logger.exception(f"refresh_pitcher_stats crashed for {pid}")
             db.rollback()
+        if i % 10 == 0:
+            logger.info(
+                f"Pitcher progress: {i}/{total_pitchers} ({n_pitcher_ok} ok, {n_pitcher_fail} failed)"
+            )
+        time.sleep(THROTTLE_SECS)
     logger.info(f"Pitcher ingest: {n_pitcher_ok} ok, {n_pitcher_fail} failed")
 
     # Weather
