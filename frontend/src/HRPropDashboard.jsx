@@ -395,15 +395,9 @@ function SortHeader({ col, sortKey, sortDir, onClick }) {
 function HitterTable({ rows, defaultSort = "khr" }) {
   const [sortKey, setSortKey] = useState(defaultSort);
   const [sortDir, setSortDir] = useState("desc");
-  const [showBench, setShowBench] = useState(false);
-
-  const filtered = useMemo(() => {
-    if (showBench) return rows;
-    return rows.filter((r) => r.lineup_status !== "bench");
-  }, [rows, showBench]);
 
   const sorted = useMemo(() => {
-    const arr = [...filtered];
+    const arr = [...rows];
     arr.sort((a, b) => {
       const av = a[sortKey] ?? -Infinity;
       const bv = b[sortKey] ?? -Infinity;
@@ -411,7 +405,7 @@ function HitterTable({ rows, defaultSort = "khr" }) {
       return sortDir === "desc" ? -cmp : cmp;
     });
     return arr;
-  }, [filtered, sortKey, sortDir]);
+  }, [rows, sortKey, sortDir]);
 
   const ranges = useMemo(() => computeRanges(sorted, HITTER_COLS), [sorted]);
 
@@ -439,47 +433,8 @@ function HitterTable({ rows, defaultSort = "khr" }) {
     );
   }
 
-  const benchCount = rows.filter((r) => r.lineup_status === "bench").length;
-
   return (
     <>
-      {benchCount > 0 && (
-        <div
-          style={{
-            marginBottom: 8,
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            fontSize: 11,
-            color: "#a8a29e",
-          }}
-        >
-          <label
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              cursor: "pointer",
-              userSelect: "none",
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={showBench}
-              onChange={(e) => setShowBench(e.target.checked)}
-              style={{ accentColor: "#fb923c", cursor: "pointer" }}
-            />
-            <span
-              style={{
-                fontFamily: "JetBrains Mono, monospace",
-                letterSpacing: "0.05em",
-              }}
-            >
-              SHOW BENCH ({benchCount})
-            </span>
-          </label>
-        </div>
-      )}
       <div
         style={{
           overflowX: "auto",
@@ -1081,15 +1036,12 @@ function deriveTier(p) {
 
 function GameDetail({ gamePk, onBack }) {
   const { data, error, loading } = useGameDetail(gamePk);
+  const [hitterTab, setHitterTab] = useState("away");
 
   if (loading) return <CenteredLoader text="Loading game..." />;
   if (error) return <ErrorPanel error={error} />;
   if (!data) return null;
 
-  const allHitters = [
-    ...(data.away_hitters || []),
-    ...(data.home_hitters || []),
-  ];
   const pitcherRows = [
     data.away_pitcher && {
       ...data.away_pitcher,
@@ -1108,6 +1060,12 @@ function GameDetail({ gamePk, onBack }) {
       tier: deriveTier(data.home_pitcher),
     },
   ].filter(Boolean);
+
+  const hitterTabs = [
+    { key: "away", label: data.away_team, rows: data.away_hitters || [] },
+    { key: "home", label: data.home_team, rows: data.home_hitters || [] },
+  ];
+  const activeHitters = hitterTabs.find((t) => t.key === hitterTab)?.rows || [];
 
   return (
     <div>
@@ -1175,10 +1133,56 @@ function GameDetail({ gamePk, onBack }) {
 
       <div style={{ height: 24 }} />
 
-      <SectionHeader>
-        Batters · sorted by kHR · click any header to re-sort
-      </SectionHeader>
-      <HitterTable rows={allHitters} defaultSort="khr" />
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 0,
+          marginBottom: 12,
+          borderBottom: "1px solid #292524",
+        }}
+      >
+        <span
+          style={{
+            fontFamily: "JetBrains Mono, monospace",
+            fontSize: 11,
+            color: "#a8a29e",
+            textTransform: "uppercase",
+            letterSpacing: "0.12em",
+            marginRight: 16,
+          }}
+        >
+          Batters
+        </span>
+        <div style={{ display: "flex", gap: 0 }}>
+          {hitterTabs.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setHitterTab(t.key)}
+              style={{
+                padding: "6px 16px",
+                fontFamily: "JetBrains Mono, monospace",
+                fontSize: 11,
+                fontWeight: 600,
+                letterSpacing: "0.08em",
+                background: "transparent",
+                color: hitterTab === t.key ? "#fb923c" : "#78716c",
+                border: "none",
+                borderBottom:
+                  hitterTab === t.key
+                    ? "2px solid #fb923c"
+                    : "2px solid transparent",
+                cursor: "pointer",
+                transition: "all 0.1s",
+                marginBottom: -1,
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <HitterTable rows={activeHitters} defaultSort="khr" />
     </div>
   );
 }
