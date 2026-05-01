@@ -8,9 +8,8 @@ Computes the full Kasper-style stat set:
   Pitcher: Pitch Score, Strikeout Score, xwOBA, CSW%, SwStr%, PutAway%, Ball%,
            SIERA, PulledBrl%, Brl/BIP%
 """
-
-import logging
 import os
+import logging
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -20,8 +19,8 @@ import pandas as pd
 import pybaseball
 from sqlalchemy.orm import Session
 
-from app.constants import PARK_CF_BEARING, STADIUM_COORDS
-from app.models.db import BatterStats, Game, Lineup, PitcherStats, Player
+from app.constants import STADIUM_COORDS, PARK_CF_BEARING
+from app.models.db import Player, BatterStats, PitcherStats, Game, Lineup
 from app.services.scoring import (
     compute_khr,
     compute_sample_tier,
@@ -57,7 +56,6 @@ def _py(v):
         return {k: _py(x) for k, x in v.items()}
     return v
 
-
 # Without this, you'll get rate-limited by Baseball Savant within minutes.
 pybaseball.cache.enable()
 
@@ -68,7 +66,6 @@ OWM_BASE = "https://api.openweathermap.org/data/2.5/weather"
 # =============================================================================
 # MLB STATS API
 # =============================================================================
-
 
 async def fetch_todays_games(target_date: Optional[date] = None) -> list[dict]:
     target_date = target_date or date.today()
@@ -85,23 +82,17 @@ async def fetch_todays_games(target_date: Optional[date] = None) -> list[dict]:
     games = []
     for date_block in data.get("dates", []):
         for g in date_block.get("games", []):
-            games.append(
-                {
-                    "game_pk": g["gamePk"],
-                    "game_date": target_date,
-                    "game_time_utc": g.get("gameDate"),
-                    "home_team": g["teams"]["home"]["team"]["abbreviation"],
-                    "away_team": g["teams"]["away"]["team"]["abbreviation"],
-                    "home_pitcher_id": g["teams"]["home"]
-                    .get("probablePitcher", {})
-                    .get("id"),
-                    "away_pitcher_id": g["teams"]["away"]
-                    .get("probablePitcher", {})
-                    .get("id"),
-                    "venue_team": g["teams"]["home"]["team"]["abbreviation"],
-                    "status": g["status"]["abstractGameState"],
-                }
-            )
+            games.append({
+                "game_pk": g["gamePk"],
+                "game_date": target_date,
+                "game_time_utc": g.get("gameDate"),
+                "home_team": g["teams"]["home"]["team"]["abbreviation"],
+                "away_team": g["teams"]["away"]["team"]["abbreviation"],
+                "home_pitcher_id": g["teams"]["home"].get("probablePitcher", {}).get("id"),
+                "away_pitcher_id": g["teams"]["away"].get("probablePitcher", {}).get("id"),
+                "venue_team": g["teams"]["home"]["team"]["abbreviation"],
+                "status": g["status"]["abstractGameState"],
+            })
     return games
 
 
@@ -118,13 +109,11 @@ async def fetch_lineup(game_pk: int) -> dict:
         team_data = data.get("teams", {}).get(side, {})
         batting_order = team_data.get("battingOrder", [])
         for i, pid in enumerate(batting_order[:9]):
-            result[side].append(
-                {
-                    "batter_id": int(pid),
-                    "batting_order": i + 1,
-                    "confirmed": 1 if batting_order else 0,
-                }
-            )
+            result[side].append({
+                "batter_id": int(pid),
+                "batting_order": i + 1,
+                "confirmed": 1 if batting_order else 0,
+            })
     return result
 
 
@@ -152,7 +141,6 @@ async def fetch_player_meta(mlbam_id: int) -> Optional[dict]:
 # =============================================================================
 # WEATHER
 # =============================================================================
-
 
 async def fetch_weather(team_code: str) -> dict:
     api_key = os.getenv("OPENWEATHER_API_KEY")
@@ -193,7 +181,6 @@ async def fetch_weather(team_code: str) -> dict:
 # =============================================================================
 # STATCAST INGESTION
 # =============================================================================
-
 
 def _hot_zones(df: pd.DataFrame) -> list[list[float]]:
     """3x3 grid of % of HRs by zone (1-9 grid)."""
@@ -248,27 +235,14 @@ def _swing_rates(df: pd.DataFrame) -> tuple[float, float]:
         return 67.0, 28.0  # league averages
 
     swing_descs = {
-        "swinging_strike",
-        "swinging_strike_blocked",
-        "foul",
-        "foul_tip",
-        "hit_into_play",
-        "hit_into_play_no_out",
-        "hit_into_play_score",
+        "swinging_strike", "swinging_strike_blocked", "foul", "foul_tip",
+        "hit_into_play", "hit_into_play_no_out", "hit_into_play_score",
     }
     df_z = df[df["zone"].between(1, 9)]
     df_o = df[df["zone"].between(11, 14)]
 
-    z_swing = (
-        (df_z["description"].isin(swing_descs).sum() / len(df_z) * 100)
-        if len(df_z)
-        else 67.0
-    )
-    o_swing = (
-        (df_o["description"].isin(swing_descs).sum() / len(df_o) * 100)
-        if len(df_o)
-        else 28.0
-    )
+    z_swing = (df_z["description"].isin(swing_descs).sum() / len(df_z) * 100) if len(df_z) else 67.0
+    o_swing = (df_o["description"].isin(swing_descs).sum() / len(df_o) * 100) if len(df_o) else 28.0
     return round(float(z_swing), 1), round(float(o_swing), 1)
 
 
@@ -322,7 +296,7 @@ def _edge_and_heart_pct(df: pd.DataFrame) -> tuple[float, float]:
 def _hr_form_pct_and_arrow(df: pd.DataFrame) -> tuple[float, str]:
     """
     LEGACY display metric — kept for backwards compat in API payload.
-    Form v2 (`_compute_form_v2_inputs`) is what actually drives ranking.
+    Form v2 is what actually drives ranking.
 
     HR Form % — share of recent batted balls that have HR-shaped contact
     (barrels). Arrow compares last-15-day rate to the prior 15.
@@ -331,27 +305,47 @@ def _hr_form_pct_and_arrow(df: pd.DataFrame) -> tuple[float, str]:
     if bbe.empty:
         return 0.0, "flat"
 
+    end = pd.to_datetime(bbe["game_date"]).max()
+    if pd.isna(end):
+        return 0.0, "flat"
+    cutoff_recent = end - pd.Timedelta(days=15)
+    cutoff_prior = end - pd.Timedelta(days=30)
+
+    recent = bbe[pd.to_datetime(bbe["game_date"]) >= cutoff_recent]
+    prior = bbe[
+        (pd.to_datetime(bbe["game_date"]) < cutoff_recent)
+        & (pd.to_datetime(bbe["game_date"]) >= cutoff_prior)
+    ]
+
+    def _barrel_pct(d):
+        if d.empty:
+            return 0.0
+        if "launch_speed_angle" not in d.columns:
+            return 0.0
+        return d["launch_speed_angle"].eq(6).sum() / len(d) * 100
+
+    recent_pct = _barrel_pct(recent)
+    prior_pct = _barrel_pct(prior)
+
+    if recent_pct > prior_pct + 3:
+        arrow = "up"
+    elif recent_pct < prior_pct - 3:
+        arrow = "down"
+    else:
+        arrow = "flat"
+
+    overall = _barrel_pct(bbe)
+    return round(float(overall), 1), arrow
+
 
 def _bbe_metrics(bbe: pd.DataFrame, hrs_count: int = None) -> dict:
     """Compute the five Form v2 metric values from a batted-balls dataframe."""
     if bbe is None or bbe.empty:
         return {}
     n = len(bbe)
-    barrel_rate = (
-        (bbe["launch_speed_angle"].eq(6).sum() / n * 100)
-        if "launch_speed_angle" in bbe.columns
-        else None
-    )
-    hard_hit = (
-        ((bbe["launch_speed"] >= 95).sum() / n * 100)
-        if "launch_speed" in bbe.columns
-        else None
-    )
-    xwoba_con = (
-        float(bbe["estimated_woba_using_speedangle"].mean())
-        if "estimated_woba_using_speedangle" in bbe.columns
-        else None
-    )
+    barrel_rate = (bbe["launch_speed_angle"].eq(6).sum() / n * 100) if "launch_speed_angle" in bbe.columns else None
+    hard_hit = ((bbe["launch_speed"] >= 95).sum() / n * 100) if "launch_speed" in bbe.columns else None
+    xwoba_con = float(bbe["estimated_woba_using_speedangle"].mean()) if "estimated_woba_using_speedangle" in bbe.columns else None
     if xwoba_con is not None and pd.isna(xwoba_con):
         xwoba_con = None
     bat_speed = None
@@ -359,9 +353,7 @@ def _bbe_metrics(bbe: pd.DataFrame, hrs_count: int = None) -> dict:
         v = bbe["bat_speed"].mean()
         bat_speed = float(v) if not pd.isna(v) else None
     if hrs_count is None:
-        hrs_count = (
-            int((bbe["events"] == "home_run").sum()) if "events" in bbe.columns else 0
-        )
+        hrs_count = int((bbe["events"] == "home_run").sum()) if "events" in bbe.columns else 0
     hr_per_bbe = hrs_count / n if n else 0.0
     return {
         "barrel_rate": barrel_rate,
@@ -409,9 +401,7 @@ def fetch_season_baseline(mlbam_id: int) -> Optional[dict]:
     if today <= season_start:
         return None
     try:
-        df = pybaseball.statcast_batter(
-            season_start.isoformat(), today.isoformat(), mlbam_id
-        )
+        df = pybaseball.statcast_batter(season_start.isoformat(), today.isoformat(), mlbam_id)
     except Exception as e:
         logger.warning(f"season baseline fetch failed for {mlbam_id}: {e}")
         return None
@@ -421,38 +411,6 @@ def fetch_season_baseline(mlbam_id: int) -> Optional[dict]:
     if len(bbe) < 50:
         return None
     return _bbe_metrics(bbe)
-    # Recent vs prior split
-    end = pd.to_datetime(df["game_date"]).max()
-    if pd.isna(end):
-        return 0.0, "flat"
-    cutoff_recent = end - pd.Timedelta(days=15)
-    cutoff_prior = end - pd.Timedelta(days=30)
-
-    recent = bbe[pd.to_datetime(bbe["game_date"]) >= cutoff_recent]
-    prior = bbe[
-        (pd.to_datetime(bbe["game_date"]) < cutoff_recent)
-        & (pd.to_datetime(bbe["game_date"]) >= cutoff_prior)
-    ]
-
-    def _barrel_pct(d):
-        if d.empty:
-            return 0.0
-        if "launch_speed_angle" not in d.columns:
-            return 0.0
-        return d["launch_speed_angle"].eq(6).sum() / len(d) * 100
-
-    recent_pct = _barrel_pct(recent)
-    prior_pct = _barrel_pct(prior)
-
-    if recent_pct > prior_pct + 3:
-        arrow = "up"
-    elif recent_pct < prior_pct - 3:
-        arrow = "down"
-    else:
-        arrow = "flat"
-
-    overall = _barrel_pct(bbe)
-    return round(overall, 1), arrow
 
 
 def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
@@ -474,10 +432,8 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
     barrel_pct = (bbe["launch_speed_angle"].eq(6).sum() / n_bbe * 100) if n_bbe else 0
     hard_hit_pct = ((bbe["launch_speed"] >= 95).sum() / n_bbe * 100) if n_bbe else 0
     sweet_spot_pct = (
-        (((bbe["launch_angle"] >= 8) & (bbe["launch_angle"] <= 32)).sum() / n_bbe * 100)
-        if n_bbe
-        else 0
-    )
+        ((bbe["launch_angle"] >= 8) & (bbe["launch_angle"] <= 32)).sum() / n_bbe * 100
+    ) if n_bbe else 0
 
     # Pulled barrels — pulled = hc_x position relative to handedness
     # Simpler heuristic: barrels with hit_distance > 350ft to pull side
@@ -485,7 +441,7 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
     if n_bbe and "launch_speed_angle" in bbe.columns:
         barrels_df = bbe[bbe["launch_speed_angle"] == 6]
         if not barrels_df.empty and "hc_x" in barrels_df.columns:
-            stand = df["stand"].iloc[0] if not df["stand"].empty else "R"
+            stand = (df["stand"].iloc[0] if not df["stand"].empty else "R")
             if stand == "R":
                 pulled = barrels_df[barrels_df["hc_x"] < 125]
             else:
@@ -494,33 +450,15 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
     pulled_barrel_pct = (pulled_barrels / n_bbe * 100) if n_bbe else 0
 
     # Whiff / SwStr%
-    swings = df[
-        df["description"].isin(
-            [
-                "swinging_strike",
-                "swinging_strike_blocked",
-                "foul",
-                "foul_tip",
-                "hit_into_play",
-                "hit_into_play_no_out",
-                "hit_into_play_score",
-            ]
-        )
-    ]
+    swings = df[df["description"].isin(["swinging_strike", "swinging_strike_blocked",
+                                          "foul", "foul_tip", "hit_into_play",
+                                          "hit_into_play_no_out", "hit_into_play_score"])]
     whiffs = df[df["description"].isin(["swinging_strike", "swinging_strike_blocked"])]
     swstr_pct = (len(whiffs) / len(df) * 100) if len(df) else 0
 
     # Expected stats
-    xwoba = (
-        df["estimated_woba_using_speedangle"].mean()
-        if "estimated_woba_using_speedangle" in df
-        else 0
-    )
-    xwoba_con = (
-        bbe["estimated_woba_using_speedangle"].mean()
-        if n_bbe and "estimated_woba_using_speedangle" in bbe
-        else 0
-    )
+    xwoba = df["estimated_woba_using_speedangle"].mean() if "estimated_woba_using_speedangle" in df else 0
+    xwoba_con = bbe["estimated_woba_using_speedangle"].mean() if n_bbe and "estimated_woba_using_speedangle" in bbe else 0
 
     # ISO — slugging minus avg, but we approximate from events directly
     hits = df[df["events"].isin(["single", "double", "triple", "home_run"])]
@@ -542,7 +480,6 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
     # Form
     hrs = df[df["events"] == "home_run"]
     end_dt = pd.to_datetime(end)
-
     def _hrs_in_window(days):
         cutoff = end_dt - pd.Timedelta(days=days)
         if hrs.empty:
@@ -585,15 +522,10 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
 
     if baseline_source == "none" or not recent_metrics:
         # Not enough data — neutral form
-        form_v2 = {
-            "form_score": 50.0,
-            "form_arrow": "flat",
-            "form_breakdown": {},
-            "baseline_source": "none",
-        }
+        form_v2 = {"form_score": 50.0, "form_arrow": "flat",
+                   "form_breakdown": {}, "baseline_source": "none"}
     else:
         from app.services.scoring import compute_form_v2
-
         form_v2 = compute_form_v2(recent_metrics, baseline_metrics, baseline_source)
 
     stats = BatterStats(
@@ -658,9 +590,7 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
 
     # CSW%, SwStr%, Ball%, PutAway%
     called_strikes = (df["description"] == "called_strike").sum()
-    whiffs = (
-        df["description"].isin(["swinging_strike", "swinging_strike_blocked"]).sum()
-    )
+    whiffs = df["description"].isin(["swinging_strike", "swinging_strike_blocked"]).sum()
     balls = df["description"].isin(["ball", "blocked_ball", "hit_by_pitch"]).sum()
     csw_rate = (called_strikes + whiffs) / pitches * 100 if pitches else 0
     swstr_rate = whiffs / pitches * 100 if pitches else 0
@@ -677,17 +607,11 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
     hr_per_9 = (hrs_allowed / max(est_ip, 1)) * 9
 
     # xwOBA against
-    xwoba = (
-        df["estimated_woba_using_speedangle"].mean()
-        if "estimated_woba_using_speedangle" in df
-        else 0
-    )
+    xwoba = df["estimated_woba_using_speedangle"].mean() if "estimated_woba_using_speedangle" in df else 0
     xwoba = float(xwoba) if not pd.isna(xwoba) else 0
 
     # Pulled barrels & Brl/BIP
-    barrels = (
-        (bbe["launch_speed_angle"] == 6).sum() if "launch_speed_angle" in bbe else 0
-    )
+    barrels = (bbe["launch_speed_angle"] == 6).sum() if "launch_speed_angle" in bbe else 0
     brl_bip = (barrels / len(bbe) * 100) if len(bbe) else 0
 
     # SIERA — best from pybaseball seasonal leaderboard, fall back to estimate
@@ -697,18 +621,14 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
     zone_by_type = _pitcher_zone_profile_by_pitch_type(df, top_n=3)
     edge_pct, heart_pct = _edge_and_heart_pct(df)
 
-    pitcher_obj = type(
-        "P",
-        (),
-        {
-            "csw_rate": csw_rate,
-            "swstr_rate": swstr_rate,
-            "putaway_rate": putaway_rate,
-            "ball_rate": ball_rate,
-            "xwoba_against": xwoba,
-            "siera": siera,
-        },
-    )()
+    pitcher_obj = type("P", (), {
+        "csw_rate": csw_rate,
+        "swstr_rate": swstr_rate,
+        "putaway_rate": putaway_rate,
+        "ball_rate": ball_rate,
+        "xwoba_against": xwoba,
+        "siera": siera,
+    })()
     quality = score_pitcher_quality(pitcher_obj)
 
     stats = PitcherStats(
@@ -744,25 +664,22 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
 # DAILY ORCHESTRATION
 # =============================================================================
 
-
 async def run_daily_refresh(db: Session):
     games = await fetch_todays_games()
     logger.info(f"Found {len(games)} games today")
 
     for g in games:
-        db.merge(
-            Game(
-                game_pk=g["game_pk"],
-                game_date=g["game_date"],
-                game_time_utc=g["game_time_utc"],
-                home_team=g["home_team"],
-                away_team=g["away_team"],
-                home_pitcher_id=g["home_pitcher_id"],
-                away_pitcher_id=g["away_pitcher_id"],
-                venue=g["venue_team"],
-                status=g["status"],
-            )
-        )
+        db.merge(Game(
+            game_pk=g["game_pk"],
+            game_date=g["game_date"],
+            game_time_utc=g["game_time_utc"],
+            home_team=g["home_team"],
+            away_team=g["away_team"],
+            home_pitcher_id=g["home_pitcher_id"],
+            away_pitcher_id=g["away_pitcher_id"],
+            venue=g["venue_team"],
+            status=g["status"],
+        ))
     db.commit()
 
     all_batter_ids = set()
@@ -771,24 +688,20 @@ async def run_daily_refresh(db: Session):
         lineup = await fetch_lineup(g["game_pk"])
         for side, team_code in [("home", g["home_team"]), ("away", g["away_team"])]:
             for entry in lineup[side]:
-                db.merge(
-                    Lineup(
-                        game_pk=g["game_pk"],
-                        team=team_code,
-                        batter_id=entry["batter_id"],
-                        batting_order=entry["batting_order"],
-                        confirmed=entry["confirmed"],
-                    )
-                )
+                db.merge(Lineup(
+                    game_pk=g["game_pk"],
+                    team=team_code,
+                    batter_id=entry["batter_id"],
+                    batting_order=entry["batting_order"],
+                    confirmed=entry["confirmed"],
+                ))
                 all_batter_ids.add(entry["batter_id"])
         if g["home_pitcher_id"]:
             all_pitcher_ids.add(g["home_pitcher_id"])
         if g["away_pitcher_id"]:
             all_pitcher_ids.add(g["away_pitcher_id"])
     db.commit()
-    logger.info(
-        f"Refreshing {len(all_batter_ids)} batters, {len(all_pitcher_ids)} pitchers"
-    )
+    logger.info(f"Refreshing {len(all_batter_ids)} batters, {len(all_pitcher_ids)} pitchers")
 
     # Player meta — fast, but ~150 calls
     for pid in list(all_batter_ids) + list(all_pitcher_ids):
@@ -799,10 +712,31 @@ async def run_daily_refresh(db: Session):
     db.commit()
 
     # Statcast pulls — slow
+    n_batter_ok = 0
+    n_batter_fail = 0
     for bid in all_batter_ids:
-        refresh_batter_stats(db, bid)
+        try:
+            result = refresh_batter_stats(db, bid)
+            if result is not None:
+                n_batter_ok += 1
+        except Exception:
+            n_batter_fail += 1
+            logger.exception(f"refresh_batter_stats crashed for {bid}")
+            db.rollback()  # so we can keep ingesting other batters
+    logger.info(f"Batter ingest: {n_batter_ok} ok, {n_batter_fail} failed")
+
+    n_pitcher_ok = 0
+    n_pitcher_fail = 0
     for pid in all_pitcher_ids:
-        refresh_pitcher_stats(db, pid)
+        try:
+            result = refresh_pitcher_stats(db, pid)
+            if result is not None:
+                n_pitcher_ok += 1
+        except Exception:
+            n_pitcher_fail += 1
+            logger.exception(f"refresh_pitcher_stats crashed for {pid}")
+            db.rollback()
+    logger.info(f"Pitcher ingest: {n_pitcher_ok} ok, {n_pitcher_fail} failed")
 
     # Weather
     for g in games:
@@ -815,7 +749,6 @@ async def run_daily_refresh(db: Session):
 
     # Snapshot today's picks for backtesting
     from app.services.picks_log import snapshot_daily_picks
-
     snapshot_daily_picks(db)
 
     logger.info("Daily refresh complete")
