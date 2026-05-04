@@ -225,8 +225,11 @@ def _extract_player_outcome(box: dict, player_id: int, prop_type: str) -> Option
 
         if prop_type == "hr":
             batting = stats.get("batting", {})
-            hr_count = int(batting.get("homeRuns", 0))
-            pa = int(batting.get("plateAppearances", 0))
+            try:
+                hr_count = int(batting.get("homeRuns", 0))
+                pa = int(batting.get("plateAppearances", 0))
+            except (TypeError, ValueError):
+                hr_count, pa = 0, 0
             return {
                 "hit_hr": 1 if hr_count >= 1 else 0,
                 "hr_count": hr_count,
@@ -236,7 +239,10 @@ def _extract_player_outcome(box: dict, player_id: int, prop_type: str) -> Option
             }
         if prop_type == "k":
             pitching = stats.get("pitching", {})
-            ks = int(pitching.get("strikeOuts", 0))
+            try:
+                ks = int(pitching.get("strikeOuts", 0))
+            except (TypeError, ValueError):
+                ks = 0
             ip_str = pitching.get("inningsPitched", "0.0")
             try:
                 ip = float(ip_str)

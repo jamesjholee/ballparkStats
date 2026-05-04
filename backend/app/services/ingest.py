@@ -37,10 +37,19 @@ def _py(v):
     Coerce numpy scalars / pandas NA to native Python types so psycopg2 can
     serialize them. Without this, np.float64 sneaks into SQL params and
     Postgres tries to parse `np.float64(72.9)` as a function call.
+
+    Containers are handled before pd.isna() because pd.isna(some_dict) in
+    pandas 2.x returns a dict of booleans, which is truthy, so the isna
+    branch would incorrectly return None for every non-empty dict/list.
     """
     if v is None:
         return None
-    # pandas NaN / NaT
+    # Handle containers before the scalar isna check
+    if isinstance(v, (np.ndarray, list)):
+        return [_py(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _py(x) for k, x in v.items()}
+    # Now safe to call pd.isna on a scalar
     try:
         if pd.isna(v):
             return None
@@ -52,10 +61,6 @@ def _py(v):
         return float(v)
     if isinstance(v, np.bool_):
         return bool(v)
-    if isinstance(v, (np.ndarray, list)):
-        return [_py(x) for x in v]
-    if isinstance(v, dict):
-        return {k: _py(x) for k, x in v.items()}
     return v
 
 
@@ -63,6 +68,22 @@ def _py(v):
 pybaseball.cache.enable()
 
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
+
+# MLB Stats API uses different abbreviations than our internal convention in a
+# few cases. Normalize at the boundary so the rest of the code stays clean.
+_ABBREV_NORMALIZE: dict[str, str] = {
+    "AZ": "ARI",   # Diamondbacks — API returns "AZ", we use "ARI" everywhere
+    "CWS": "CHW",  # White Sox — API sometimes returns "CWS"
+    "WAS": "WSH",  # Nationals — API sometimes returns "WAS"
+}
+
+
+def _norm_team(code: Optional[str]) -> Optional[str]:
+    if not code:
+        return code
+    return _ABBREV_NORMALIZE.get(code, code)
+
+
 OWM_BASE = "https://api.openweathermap.org/data/2.5/weather"
 
 # Lookback window for player stats refreshes
@@ -104,20 +125,22 @@ async def fetch_todays_games(target_date: Optional[date] = None) -> list[dict]:
                 "home": _extract_projected_lineup(lineups_block.get("homePlayers", [])),
                 "away": _extract_projected_lineup(lineups_block.get("awayPlayers", [])),
             }
+            home_abbr = _norm_team(g["teams"]["home"]["team"]["abbreviation"])
+            away_abbr = _norm_team(g["teams"]["away"]["team"]["abbreviation"])
             games.append(
                 {
                     "game_pk": g["gamePk"],
                     "game_date": target_date,
                     "game_time_utc": g.get("gameDate"),
-                    "home_team": g["teams"]["home"]["team"]["abbreviation"],
-                    "away_team": g["teams"]["away"]["team"]["abbreviation"],
+                    "home_team": home_abbr,
+                    "away_team": away_abbr,
                     "home_pitcher_id": g["teams"]["home"]
                     .get("probablePitcher", {})
                     .get("id"),
                     "away_pitcher_id": g["teams"]["away"]
                     .get("probablePitcher", {})
                     .get("id"),
-                    "venue_team": g["teams"]["home"]["team"]["abbreviation"],
+                    "venue_team": home_abbr,
                     "status": g["status"]["abstractGameState"],
                     "projected_lineup": projected,
                 }
@@ -239,7 +262,7 @@ async def fetch_player_meta(mlbam_id: int) -> Optional[dict]:
         "position": p.get("primaryPosition", {}).get("abbreviation", "?"),
         "bats": p.get("batSide", {}).get("code", "?"),
         "throws": p.get("pitchHand", {}).get("code", "?"),
-        "team": p.get("currentTeam", {}).get("abbreviation"),
+        "team": _norm_team(p.get("currentTeam", {}).get("abbreviation")),
     }
 
 
@@ -579,7 +602,8 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
     if n_bbe and "launch_speed_angle" in bbe.columns:
         barrels_df = bbe[bbe["launch_speed_angle"] == 6]
         if not barrels_df.empty and "hc_x" in barrels_df.columns:
-            stand = df["stand"].iloc[0] if not df["stand"].empty else "R"
+            _stand_vals = df["stand"].dropna()
+            stand = str(_stand_vals.iloc[0]) if len(_stand_vals) else "R"
             if stand == "R":
                 pulled = barrels_df[barrels_df["hc_x"] < 125]
             else:
@@ -751,9 +775,9 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
     bbe = df[df["type"] == "X"]
     pitches = len(df)
 
-    # Pitch mix
+    # Pitch mix — explicit str/float coercion so json.dumps never sees numpy types
     mix = df["pitch_type"].value_counts(normalize=True).head(5)
-    pitch_mix = {k: round(v, 3) for k, v in mix.items() if pd.notna(k)}
+    pitch_mix = {str(k): round(float(v), 3) for k, v in mix.items() if pd.notna(k)}
 
     # CSW%, SwStr%, Ball%, PutAway%
     called_strikes = (df["description"] == "called_strike").sum()
@@ -810,10 +834,13 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
     )()
     quality = score_pitcher_quality(pitcher_obj)
 
+    _throws_vals = df["p_throws"].dropna()
+    throws = str(_throws_vals.iloc[0]) if len(_throws_vals) else "R"
+
     stats = PitcherStats(
         mlbam_id=mlbam_id,
         as_of=end,
-        throws=str(df["p_throws"].iloc[0]) if not df.empty else "R",
+        throws=throws,
         pitches=_py(pitches),
         pitch_score=_py(quality["pitch_score"]),
         strikeout_score=_py(quality["strikeout_score"]),
@@ -934,9 +961,10 @@ async def run_daily_refresh(db: Session):
     db.commit()
 
     # Statcast pulls — slow. Throttle between calls to avoid rate-limit pauses.
-    # Baseball Savant tolerates ~1 req/sec sustained. We target 0.4s between calls
-    # which gives ~400 batters in ~3-4 min (plus the actual fetch time per call).
-    THROTTLE_SECS = 0.4
+    # Baseball Savant tolerates ~1 req/sec sustained. When pybaseball cache is
+    # warm a cached call returns in <50ms, so 1.0s sleep ensures we never exceed
+    # that rate even on cache-hit bursts. Adds ~7 min for 400 batters vs 0.4s.
+    THROTTLE_SECS = 1.0
 
     n_batter_ok = 0
     n_batter_fail = 0
