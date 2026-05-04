@@ -160,3 +160,113 @@ def backtest_component(
         "bucket_size": bucket_size,
         "buckets": output,
     }
+
+
+@router.get("/api/backtest/log")
+def backtest_log(
+    days: int = Query(7, ge=1, le=30),
+    prop_type: str = Query("hr"),
+    db: Session = Depends(get_db),
+):
+    """
+    Row-level picks log for the last N days.
+    Left-joins PickSnapshot to PickOutcome so pending picks (no outcome yet)
+    are included with game_status='pending'. HR props are filtered to lineup
+    players only (batting_order IS NOT NULL).
+    """
+    cutoff = date.today() - timedelta(days=days)
+
+    rows = (
+        db.query(PickSnapshot, PickOutcome)
+        .outerjoin(
+            PickOutcome,
+            (PickSnapshot.game_date == PickOutcome.game_date)
+            & (PickSnapshot.game_pk == PickOutcome.game_pk)
+            & (PickSnapshot.player_id == PickOutcome.player_id)
+            & (PickSnapshot.prop_type == PickOutcome.prop_type),
+        )
+        .filter(
+            PickSnapshot.game_date >= cutoff,
+            PickSnapshot.prop_type == prop_type,
+            PickSnapshot.batting_order.isnot(None),
+        )
+        .order_by(PickSnapshot.game_date.desc(), PickSnapshot.matchup_score.desc())
+        .all()
+    )
+
+    picks = []
+    completed = pending = hits = 0
+    tier_counts = {
+        "A": {"picks": 0, "hits": 0},
+        "B": {"picks": 0, "hits": 0},
+        "C": {"picks": 0, "hits": 0},
+        "D": {"picks": 0, "hits": 0},
+    }
+
+    for snap, out in rows:
+        ms = snap.matchup_score or 0
+        tier = "A" if ms >= 70 else "B" if ms >= 60 else "C" if ms >= 50 else "D"
+
+        if out is None:
+            game_status = "pending"
+            hit_hr = hr_count = pa = None
+            pending += 1
+        elif out.game_status == "completed":
+            game_status = "completed"
+            hit_hr = out.hit_hr
+            hr_count = out.hr_count
+            pa = out.pa
+            completed += 1
+            if hit_hr == 1:
+                hits += 1
+                tier_counts[tier]["hits"] += 1
+            tier_counts[tier]["picks"] += 1
+        else:
+            game_status = out.game_status  # "postponed" | "did_not_play"
+            hit_hr = None
+            hr_count = None
+            pa = out.pa
+
+        picks.append({
+            "game_date": snap.game_date.isoformat(),
+            "game_pk": snap.game_pk,
+            "player_id": snap.player_id,
+            "player_name": snap.player_name,
+            "team": snap.team,
+            "opponent_team": snap.opponent_team,
+            "venue": snap.venue,
+            "batting_order": snap.batting_order,
+            "matchup_score": snap.matchup_score,
+            "test_score": snap.test_score,
+            "ceiling": snap.ceiling,
+            "zone_fit": snap.zone_fit,
+            "form_score": snap.form_score,
+            "khr": snap.khr,
+            "sample_tier": snap.sample_tier,
+            "tier": tier,
+            "game_status": game_status,
+            "hit_hr": hit_hr,
+            "hr_count": hr_count,
+            "pa": pa,
+        })
+
+    by_tier = {
+        t: {
+            "picks": v["picks"],
+            "hits": v["hits"],
+            "hit_rate_pct": round(v["hits"] / v["picks"] * 100, 1) if v["picks"] else None,
+        }
+        for t, v in tier_counts.items()
+    }
+
+    return {
+        "days": days,
+        "prop_type": prop_type,
+        "total": len(rows),
+        "completed": completed,
+        "pending": pending,
+        "hits": hits,
+        "hit_rate_pct": round(hits / completed * 100, 1) if completed else None,
+        "by_tier": by_tier,
+        "picks": picks,
+    }

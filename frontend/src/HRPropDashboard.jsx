@@ -345,6 +345,33 @@ function useGameDetail(gamePk) {
   return { data, error, loading };
 }
 
+function useBacktestLog(days, propType) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setData(null);
+    setError(null);
+    fetch(`${API_BASE}/api/backtest/log?days=${days}&prop_type=${propType}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`API ${r.status}`);
+        return r.json();
+      })
+      .then((d) => {
+        if (!cancelled) { setData(d); setLoading(false); }
+      })
+      .catch((e) => {
+        if (!cancelled) { setError(e.message); setLoading(false); }
+      });
+    return () => { cancelled = true; };
+  }, [days, propType]);
+
+  return { data, error, loading };
+}
+
 // =============================================================================
 // SHARED SORT HEADER
 // =============================================================================
@@ -1277,6 +1304,451 @@ function PitcherLeaderboard({ slate }) {
 }
 
 // =============================================================================
+// BACKTEST VIEW
+// =============================================================================
+
+const TIER_COLORS = {
+  A: "#22c55e",
+  B: "#fb923c",
+  C: "#facc15",
+  D: "#78716c",
+};
+
+function BacktestStatBar({ data }) {
+  const edge =
+    data.hit_rate_pct != null ? (data.hit_rate_pct - 7.0).toFixed(1) : null;
+  const cells = [
+    { label: "TOTAL PICKS", value: data.total },
+    { label: "COMPLETED", value: data.completed },
+    { label: "PENDING", value: data.pending },
+    {
+      label: "HR RATE",
+      value: data.hit_rate_pct != null ? `${data.hit_rate_pct}%` : "—",
+      color:
+        data.hit_rate_pct == null
+          ? "#a8a29e"
+          : data.hit_rate_pct >= 10
+          ? "#22c55e"
+          : data.hit_rate_pct >= 7
+          ? "#fb923c"
+          : "#f87171",
+    },
+    { label: "BASELINE", value: "7.0%" },
+    {
+      label: "EDGE",
+      value: edge != null ? `${edge > 0 ? "+" : ""}${edge}%` : "—",
+      color:
+        edge == null ? "#a8a29e" : Number(edge) >= 0 ? "#22c55e" : "#f87171",
+    },
+  ];
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 1,
+        marginBottom: 20,
+        background: "#1c1917",
+        borderRadius: 4,
+        overflow: "hidden",
+        border: "1px solid #292524",
+      }}
+    >
+      {cells.map((c) => (
+        <div
+          key={c.label}
+          style={{
+            flex: 1,
+            padding: "10px 14px",
+            borderRight: "1px solid #292524",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 9,
+              fontFamily: "JetBrains Mono, monospace",
+              color: "#57534e",
+              letterSpacing: "0.1em",
+              marginBottom: 4,
+            }}
+          >
+            {c.label}
+          </div>
+          <div
+            style={{
+              fontSize: 18,
+              fontWeight: 700,
+              color: c.color || "#fafaf9",
+              fontFamily: "JetBrains Mono, monospace",
+            }}
+          >
+            {c.value}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function BacktestTierTable({ byTier }) {
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <div
+        style={{
+          fontFamily: "JetBrains Mono, monospace",
+          fontSize: 11,
+          color: "#a8a29e",
+          letterSpacing: "0.12em",
+          textTransform: "uppercase",
+          marginBottom: 10,
+          paddingBottom: 6,
+          borderBottom: "1px solid #292524",
+        }}
+      >
+        Performance by Tier (completed only)
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        {["A", "B", "C", "D"].map((t) => {
+          const v = byTier[t] || {};
+          return (
+            <div
+              key={t}
+              style={{
+                flex: 1,
+                padding: "10px 12px",
+                background: "#1c1917",
+                border: `1px solid ${TIER_COLORS[t]}44`,
+                borderRadius: 4,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 18,
+                  fontWeight: 800,
+                  color: TIER_COLORS[t],
+                  fontFamily: "JetBrains Mono, monospace",
+                }}
+              >
+                {t}
+              </div>
+              <div
+                style={{
+                  fontSize: 11,
+                  color: "#a8a29e",
+                  fontFamily: "JetBrains Mono, monospace",
+                  marginTop: 4,
+                }}
+              >
+                {v.picks || 0} picks
+              </div>
+              <div
+                style={{
+                  fontSize: 16,
+                  fontWeight: 700,
+                  color: "#fafaf9",
+                  fontFamily: "JetBrains Mono, monospace",
+                  marginTop: 4,
+                }}
+              >
+                {v.hit_rate_pct != null ? `${v.hit_rate_pct}%` : "—"}
+              </div>
+              <div
+                style={{
+                  fontSize: 10,
+                  color: "#57534e",
+                  fontFamily: "JetBrains Mono, monospace",
+                }}
+              >
+                {v.hits || 0} HRs
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function BacktestPickRow({ pick }) {
+  const resultColor =
+    pick.game_status === "pending"
+      ? "#44403c"
+      : pick.game_status === "did_not_play"
+      ? "#44403c"
+      : pick.hit_hr === 1
+      ? "#166534"
+      : "#7f1d1d";
+
+  const resultText =
+    pick.game_status === "pending"
+      ? "PENDING"
+      : pick.game_status === "did_not_play"
+      ? "DNP"
+      : pick.game_status === "postponed"
+      ? "PPD"
+      : pick.hit_hr === 1
+      ? `HR ${pick.hr_count > 1 ? `(${pick.hr_count})` : "✓"}`
+      : "MISS";
+
+  const resultTextColor =
+    pick.game_status === "pending" || pick.game_status === "did_not_play"
+      ? "#78716c"
+      : pick.hit_hr === 1
+      ? "#4ade80"
+      : "#f87171";
+
+  const cell = {
+    padding: "6px 10px",
+    fontSize: 12,
+    fontFamily: "JetBrains Mono, monospace",
+    color: "#e7e5e4",
+    borderRight: "1px solid #292524",
+    verticalAlign: "middle",
+  };
+
+  return (
+    <tr
+      style={{
+        borderLeft: `3px solid ${resultColor}`,
+        background:
+          pick.game_status === "pending"
+            ? "transparent"
+            : pick.hit_hr === 1
+            ? "rgba(34,197,94,0.06)"
+            : pick.game_status === "completed"
+            ? "rgba(239,68,68,0.04)"
+            : "transparent",
+      }}
+    >
+      <td style={{ ...cell, color: "#a8a29e" }}>#{pick.batting_order}</td>
+      <td style={{ ...cell, fontWeight: 600, color: "#fafaf9" }}>
+        {pick.player_name}
+      </td>
+      <td style={{ ...cell, color: "#78716c" }}>
+        {pick.team} vs {pick.opponent_team}
+      </td>
+      <td style={{ ...cell, textAlign: "right" }}>
+        {pick.matchup_score?.toFixed(1) ?? "—"}
+      </td>
+      <td style={{ ...cell, textAlign: "right", color: "#a8a29e" }}>
+        {pick.zone_fit?.toFixed(2) ?? "—"}
+      </td>
+      <td style={{ ...cell, textAlign: "right", color: "#a8a29e" }}>
+        {pick.form_score?.toFixed(1) ?? "—"}
+      </td>
+      <td style={{ ...cell, textAlign: "right", color: "#a8a29e" }}>
+        {pick.khr?.toFixed(1) ?? "—"}
+      </td>
+      <td
+        style={{
+          ...cell,
+          textAlign: "center",
+          color: TIER_COLORS[pick.tier] || "#a8a29e",
+          fontWeight: 700,
+        }}
+      >
+        {pick.tier}
+      </td>
+      <td
+        style={{
+          ...cell,
+          textAlign: "right",
+          color: resultTextColor,
+          fontWeight: 700,
+          borderRight: "none",
+        }}
+      >
+        {resultText}
+      </td>
+    </tr>
+  );
+}
+
+function BacktestDateGroup({ dateStr, picks }) {
+  const [year, month, day] = dateStr.split("-").map(Number);
+  const d = new Date(year, month - 1, day);
+  const label = d.toLocaleDateString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+  const completed = picks.filter((p) => p.game_status === "completed");
+  const hits = completed.filter((p) => p.hit_hr === 1).length;
+
+  const thStyle = {
+    padding: "5px 10px",
+    fontSize: 9,
+    fontFamily: "JetBrains Mono, monospace",
+    color: "#57534e",
+    fontWeight: 600,
+    letterSpacing: "0.08em",
+    textTransform: "uppercase",
+    textAlign: "left",
+    borderBottom: "1px solid #292524",
+    whiteSpace: "nowrap",
+  };
+
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: 12,
+          marginBottom: 8,
+          paddingBottom: 6,
+          borderBottom: "1px solid #292524",
+        }}
+      >
+        <span
+          style={{
+            fontFamily: "JetBrains Mono, monospace",
+            fontSize: 12,
+            fontWeight: 700,
+            color: "#fafaf9",
+          }}
+        >
+          {label}
+        </span>
+        {completed.length > 0 && (
+          <span
+            style={{
+              fontFamily: "JetBrains Mono, monospace",
+              fontSize: 11,
+              color: "#78716c",
+            }}
+          >
+            {hits}/{completed.length} HR
+          </span>
+        )}
+        {picks.some((p) => p.game_status === "pending") && (
+          <span
+            style={{
+              fontFamily: "JetBrains Mono, monospace",
+              fontSize: 10,
+              color: "#44403c",
+            }}
+          >
+            {picks.filter((p) => p.game_status === "pending").length} pending
+          </span>
+        )}
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              <th style={{ ...thStyle, textAlign: "right" }}>#</th>
+              <th style={thStyle}>Player</th>
+              <th style={thStyle}>Matchup</th>
+              <th style={{ ...thStyle, textAlign: "right" }}>Score</th>
+              <th style={{ ...thStyle, textAlign: "right" }}>Zone</th>
+              <th style={{ ...thStyle, textAlign: "right" }}>Form</th>
+              <th style={{ ...thStyle, textAlign: "right" }}>kHR</th>
+              <th style={{ ...thStyle, textAlign: "center" }}>Tier</th>
+              <th style={{ ...thStyle, textAlign: "right", borderRight: "none" }}>
+                Result
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {picks.map((p) => (
+              <BacktestPickRow
+                key={`${p.game_pk}-${p.player_id}`}
+                pick={p}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function BacktestView() {
+  const [days, setDays] = useState(7);
+  const { data, error, loading } = useBacktestLog(days, "hr");
+
+  const grouped = useMemo(() => {
+    if (!data?.picks) return [];
+    const map = {};
+    for (const p of data.picks) {
+      if (!map[p.game_date]) map[p.game_date] = [];
+      map[p.game_date].push(p);
+    }
+    return Object.entries(map).sort(([a], [b]) => b.localeCompare(a));
+  }, [data]);
+
+  return (
+    <div>
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          alignItems: "center",
+          marginBottom: 20,
+        }}
+      >
+        <span
+          style={{
+            fontSize: 10,
+            fontFamily: "JetBrains Mono, monospace",
+            color: "#57534e",
+            letterSpacing: "0.1em",
+          }}
+        >
+          SHOW LAST
+        </span>
+        {[2, 7, 14, 30].map((d) => (
+          <button
+            key={d}
+            onClick={() => setDays(d)}
+            style={{
+              padding: "4px 12px",
+              fontFamily: "JetBrains Mono, monospace",
+              fontSize: 11,
+              fontWeight: 600,
+              background: days === d ? "#fb923c" : "transparent",
+              color: days === d ? "#0c0a09" : "#a8a29e",
+              border: `1px solid ${days === d ? "#fb923c" : "#292524"}`,
+              borderRadius: 2,
+              cursor: "pointer",
+            }}
+          >
+            {d}D
+          </button>
+        ))}
+      </div>
+
+      {loading && <CenteredLoader text="Loading backtest log..." />}
+      {error && <ErrorPanel error={error} />}
+
+      {data && !loading && (
+        <>
+          <BacktestStatBar data={data} />
+          {data.completed > 0 && <BacktestTierTable byTier={data.by_tier} />}
+          {grouped.length === 0 ? (
+            <div
+              style={{
+                padding: "40px 0",
+                color: "#57534e",
+                fontFamily: "JetBrains Mono, monospace",
+                fontSize: 12,
+              }}
+            >
+              No picks in the last {days} day{days > 1 ? "s" : ""}. Run the
+              daily ingest and snapshot to populate.
+            </div>
+          ) : (
+            grouped.map(([dateStr, picks]) => (
+              <BacktestDateGroup key={dateStr} dateStr={dateStr} picks={picks} />
+            ))
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// =============================================================================
 // COMMON UI
 // =============================================================================
 
@@ -1408,6 +1880,7 @@ export default function HRPropDashboard() {
           {[
             { key: "games", label: "GAMES" },
             { key: "pitchers", label: "PITCHERS" },
+            { key: "backtest", label: "BACKTEST" },
           ].map((t) => (
             <button
               key={t.key}
@@ -1434,9 +1907,9 @@ export default function HRPropDashboard() {
         </nav>
       </header>
 
-      {loading && <CenteredLoader text="Loading slate..." />}
-      {error && <ErrorPanel error={error} />}
-      {slate && !error && (
+      {view !== "backtest" && loading && <CenteredLoader text="Loading slate..." />}
+      {view !== "backtest" && error && <ErrorPanel error={error} />}
+      {view !== "backtest" && slate && !error && (
         <>
           {view === "games" && !selectedGame && (
             <SlateBrowser slate={slate} onSelectGame={setSelectedGame} />
@@ -1450,6 +1923,7 @@ export default function HRPropDashboard() {
           {view === "pitchers" && <PitcherLeaderboard slate={slate} />}
         </>
       )}
+      {view === "backtest" && <BacktestView />}
 
       <footer
         style={{
