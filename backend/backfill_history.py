@@ -22,8 +22,14 @@ import logging
 import os
 import sys
 from datetime import date, timedelta
+from pathlib import Path
 
-os.environ.setdefault("DATABASE_URL", os.environ.get("DATABASE_URL", ""))
+# Load .env from the backend directory so DATABASE_URL is available
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    from dotenv import load_dotenv
+    load_dotenv(_env_path)
+
 os.environ.setdefault("OPENWEATHER_API_KEY", "")
 
 sys.path.insert(0, os.path.dirname(__file__))
