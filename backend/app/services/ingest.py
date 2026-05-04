@@ -677,7 +677,9 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
     pitches = len(df)
     sample_tier = compute_sample_tier(pitches, n_bbe)
 
-    khr = compute_khr(barrel_pct, swstr_pct, hard_hit_pct, sweet_spot_pct)
+    khr = compute_khr(barrel_pct, hard_hit_pct, sweet_spot_pct, swstr_pct,
+                      xwoba=float(xwoba) if not pd.isna(xwoba) else None,
+                      pulled_barrel_rate=pulled_barrel_pct)
 
     # Option-B zone_fit inputs
     woba_zones = _woba_zones(df)
