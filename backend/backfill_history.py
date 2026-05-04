@@ -45,7 +45,7 @@ from app.models.db import Game, Lineup, Player
 from app.services.ingest import fetch_todays_games, fetch_lineup, fetch_player_meta
 from app.services.picks_log import snapshot_daily_picks, record_outcomes
 
-OPENING_DAY_2025 = date(2025, 3, 27)
+OPENING_DAY_2026 = date(2026, 3, 20)  # safe early start; days with no games are skipped
 
 
 async def backfill_date(db, target_date: date) -> dict:
@@ -152,8 +152,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--start",
-        default=OPENING_DAY_2025.isoformat(),
-        help=f"First date to backfill (default: {OPENING_DAY_2025})",
+        default=OPENING_DAY_2026.isoformat(),
+        help=f"First date to backfill (default: {OPENING_DAY_2026})",
     )
     parser.add_argument(
         "--end",
