@@ -266,6 +266,16 @@ def build_season_leaderboards(years=None) -> dict:
         p_xw[["player_id", "xwoba_allowed"]] if not p_xw.empty else pd.DataFrame(columns=["player_id"]),
         on="player_id", how="left")
 
+    # Build league-reference composite for HR Form percentile (same units as
+    # _compute_power_composite: barrel/hh as fractions 0-1, xwoba 0-1, ev/100).
+    brl_ref = batters["brl_percent"].fillna(0) / 100
+    hh_ref  = batters["hh_percent"].fillna(0) / 100
+    spd_ref = batters["avg_hit_speed"].fillna(85) / 100
+    xw_ref  = batters["xwoba"].fillna(0.300)
+    batters["_form_composite"] = (
+        0.40 * brl_ref + 0.30 * xw_ref + 0.20 * hh_ref + 0.10 * spd_ref
+    )
+
     _LEADERBOARD_CACHE = {"batters": batters, "pitchers": pitchers}
     _LEADERBOARD_CACHE_DATE = today
     logger.info(
@@ -334,9 +344,12 @@ def _hr_form_kasper(
 
     comp = _compute_power_composite(recent_bbe)
 
-    if FORM_MODE == "percentile" and league_ref is not None and len(league_ref) > 0 and not np.isnan(comp):
+    if league_ref is not None and len(league_ref) > 0 and not np.isnan(comp):
+        # League-percentile: what fraction of MLB players have a lower recent composite.
+        # Uses leaderboard composites (season-long) as reference — no extra Statcast pull.
         form_pct = float((league_ref < comp).mean() * 100)
     else:
+        # Fallback: ratio of recent composite vs own season baseline.
         baseline_comp = _compute_power_composite(bbe)
         if pd.isna(baseline_comp) or baseline_comp == 0 or pd.isna(comp):
             form_pct = 50.0
@@ -1344,12 +1357,17 @@ async def run_daily_refresh(db: Session):
     # that rate even on cache-hit bursts. Adds ~7 min for 400 batters vs 0.4s.
     THROTTLE_SECS = 1.0
 
+    # Extract league form reference once (array of ~500 MLB player composites)
+    league_form_ref = None
+    if leaderboard and "batters" in leaderboard and "_form_composite" in leaderboard["batters"].columns:
+        league_form_ref = leaderboard["batters"]["_form_composite"].dropna().values
+
     n_batter_ok = 0
     n_batter_fail = 0
     total_batters = len(all_batter_ids)
     for i, bid in enumerate(all_batter_ids, 1):
         try:
-            result = refresh_batter_stats(db, bid, leaderboard=leaderboard)
+            result = refresh_batter_stats(db, bid, leaderboard=leaderboard, league_form_ref=league_form_ref)
             if result is not None:
                 n_batter_ok += 1
         except Exception:
