@@ -11,8 +11,10 @@ the script catches those errors and continues.
 import os
 import sys
 
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
+load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./parkblast.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)

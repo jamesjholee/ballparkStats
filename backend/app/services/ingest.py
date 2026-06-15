@@ -1038,7 +1038,7 @@ def refresh_batter_stats(
         hh_final       = _py(float(lb_row["hh_percent"])) if pd.notna(lb_row.get("hh_percent")) else _py(round(hard_hit_pct, 1))
         brl_final      = _py(float(lb_row["brl_percent"])) if pd.notna(lb_row.get("brl_percent")) else _py(round(barrel_pct, 1))
         khr_final      = _py(float(lb_row["khr_v2"])) if pd.notna(lb_row.get("khr_v2")) else _py(round(khr, 1))
-        pitches_final  = _py(int(lb_row["attempts"])) if pd.notna(lb_row.get("attempts")) else _py(pitches)
+        pitches_final  = _py(int(lb_row["pa"])) if pd.notna(lb_row.get("pa")) else _py(pitches)
         bip_final      = _py(int(lb_row["bip"])) if pd.notna(lb_row.get("bip")) else _py(n_bbe)
     else:
         iso_final      = _py(round(float(iso), 3))
