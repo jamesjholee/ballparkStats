@@ -7,39 +7,83 @@ Two functions:
   - record_outcomes()      : run ~6 hours after first pitch. Joins MLB Stats
     API box scores against pending PickSnapshot rows.
 
-The point: build a paired dataset of (predicted score, actual outcome) for every
-day of every component, so we can later answer "does form_score actually predict
-HRs above random?"
+Matchup is computed as 50+10*weighted_z(components) over the full day's slate
+(slate-level z-scoring, consistent with the slate endpoint).
 """
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import httpx
+import pandas as pd
 from sqlalchemy.orm import Session
 
+from app.constants import PARK_HR_FACTORS
 from app.models.db import (
     Game, Lineup, BatterStats, PitcherStats, Player,
     PickSnapshot, PickOutcome,
 )
-from app.services.scoring import score_batter, compute_pitcher_tier
+from app.services.scoring import (
+    compute_ceiling_kasper,
+    compute_matchup_kasper,
+    compute_pitcher_tier,
+    compute_test_score_kasper,
+    compute_zone_fit,
+    compute_weather_score,
+    pitcher_vuln_raw,
+)
 
 logger = logging.getLogger(__name__)
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
 
 
+def _batter_components(entry, batter, opp_pitcher, game, weather: dict) -> dict:
+    """Collect raw matchup components (mirrors slate.py helper)."""
+    zone_fit_score = compute_zone_fit(batter, opp_pitcher)
+    weather_score = compute_weather_score(weather)
+    park_factor = float(PARK_HR_FACTORS.get(game.venue, 100))
+    vuln = pitcher_vuln_raw(opp_pitcher)
+
+    return {
+        "_batter_id": entry.batter_id,
+        "_game_pk": game.game_pk,
+        "_team": entry.team,
+        "_opp_pitcher_id": opp_pitcher.mlbam_id if opp_pitcher else None,
+        "_venue": game.venue,
+        "_batting_order": entry.batting_order,
+        "_zone_fit_raw": zone_fit_score,
+        # Matchup components
+        "khr":            float(batter.khr or 50.0),
+        "zone_fit":       zone_fit_score,
+        "pitcher_vuln":   vuln,
+        "park_hr_factor": park_factor,
+        "environment":    weather_score,
+        # Ceiling extras
+        "fb_percent":    float(batter.fb_percent or 25.0),
+        "avg_hit_speed": float(batter.avg_exit_velo or 88.0),
+        "sample_tier":   batter.sample_tier or "thin",
+        # Passthrough for snapshot
+        "_form_score":   batter.form_score,
+        "_khr_raw":      batter.khr,
+        "_sample_tier":  batter.sample_tier,
+    }
+
+
 def snapshot_daily_picks(db: Session, target_date: Optional[date] = None) -> dict:
     """
     Walk today's slate and record a PickSnapshot row for every batter and pitcher.
-    Captures the model's prediction at the moment of ingest.
+    Matchup is batch-computed across the full slate (slate-level z-scoring).
     """
     target_date = target_date or date.today()
     games = db.query(Game).filter(Game.game_date == target_date).all()
     n_batters = 0
     n_pitchers = 0
 
+    # --- Pass 1: collect batter components across the full slate ---
+    raw_components = []
+    meta_list = []  # parallel list of (entry, batter, game, opp_pitcher_id)
+
     for game in games:
-        # ---- Batter snapshots ----
         for team_code, opp_pitcher_id in [
             (game.home_team, game.away_pitcher_id),
             (game.away_team, game.home_pitcher_id),
@@ -57,6 +101,7 @@ def snapshot_daily_picks(db: Session, target_date: Optional[date] = None) -> dic
                 .all()
             )
             opp_team = game.away_team if team_code == game.home_team else game.home_team
+
             for entry in lineup:
                 batter = (
                     db.query(BatterStats)
@@ -67,35 +112,48 @@ def snapshot_daily_picks(db: Session, target_date: Optional[date] = None) -> dic
                 if not batter:
                     continue
                 meta = db.query(Player).filter(Player.mlbam_id == entry.batter_id).first()
-                score = score_batter(batter, opp_pitcher, game.venue, game.weather_data)
+                comp = _batter_components(entry, batter, opp_pitcher, game, game.weather_data or {})
+                raw_components.append(comp)
+                meta_list.append((entry, batter, game, opp_pitcher_id, opp_team, meta))
 
-                snap = PickSnapshot(
-                    game_date=target_date,
-                    game_pk=game.game_pk,
-                    player_id=entry.batter_id,
-                    prop_type="hr",
-                    player_name=meta.full_name if meta else f"#{entry.batter_id}",
-                    team=team_code,
-                    opponent_team=opp_team,
-                    opponent_pitcher_id=opp_pitcher_id,
-                    venue=game.venue,
-                    batting_order=entry.batting_order,
-                    matchup_score=score["matchup"],
-                    test_score=score["test_score"],
-                    ceiling=score["ceiling"],
-                    zone_fit=score["zone_fit"] * 100,  # store on 0-100 scale
-                    form_score=batter.form_score,
-                    khr=batter.khr,
-                    pitch_score=None,
-                    strikeout_score=None,
-                    pitcher_tier=None,
-                    sample_tier=batter.sample_tier,
-                    snapshot_at=datetime.utcnow(),
-                )
-                db.merge(snap)
-                n_batters += 1
+    # --- Pass 2: batch matchup over the full slate ---
+    if raw_components:
+        board_df = pd.DataFrame(raw_components)
+        matchup_vals  = compute_matchup_kasper(board_df)
+        test_vals     = compute_test_score_kasper(board_df)
+        ceiling_vals  = compute_ceiling_kasper(board_df)
 
-        # ---- Pitcher snapshots (for K props) ----
+        for i, (entry, batter, game, opp_pitcher_id, opp_team, player_meta) in enumerate(meta_list):
+            snap = PickSnapshot(
+                game_date=target_date,
+                game_pk=game.game_pk,
+                player_id=entry.batter_id,
+                prop_type="hr",
+                player_name=player_meta.full_name if player_meta else f"#{entry.batter_id}",
+                team=raw_components[i]["_team"],
+                opponent_team=opp_team,
+                opponent_pitcher_id=opp_pitcher_id,
+                venue=game.venue,
+                batting_order=entry.batting_order,
+                matchup_score=float(matchup_vals.iloc[i]),
+                test_score=float(test_vals.iloc[i]),
+                ceiling=float(ceiling_vals.iloc[i]),
+                zone_fit=raw_components[i]["_zone_fit_raw"],  # stored 0-100
+                form_score=raw_components[i]["_form_score"],
+                khr=raw_components[i]["_khr_raw"],
+                pitch_score=None,
+                strikeout_score=None,
+                pitcher_tier=None,
+                sample_tier=batter.sample_tier,
+                snapshot_at=datetime.now(timezone.utc),
+            )
+            db.merge(snap)
+            n_batters += 1
+
+    db.commit()
+
+    # --- Pitcher snapshots (for K props) ---
+    for game in games:
         for pid, opp_team in [
             (game.home_pitcher_id, game.away_team),
             (game.away_pitcher_id, game.home_team),
@@ -135,13 +193,15 @@ def snapshot_daily_picks(db: Session, target_date: Optional[date] = None) -> dic
                 strikeout_score=pitcher.strikeout_score,
                 pitcher_tier=tier,
                 sample_tier=None,
-                snapshot_at=datetime.utcnow(),
+                snapshot_at=datetime.now(timezone.utc),
             )
             db.merge(snap)
             n_pitchers += 1
 
     db.commit()
-    logger.info(f"Snapshotted {n_batters} batter picks and {n_pitchers} pitcher picks for {target_date}")
+    logger.info(
+        f"Snapshotted {n_batters} batter picks and {n_pitchers} pitcher picks "
+        f"for {target_date}")
     return {"batters": n_batters, "pitchers": n_pitchers, "date": target_date.isoformat()}
 
 
@@ -159,7 +219,6 @@ async def record_outcomes(db: Session, target_date: Optional[date] = None) -> di
     if not snapshots:
         return {"recorded": 0, "skipped": 0, "date": target_date.isoformat()}
 
-    # Cache one box-score fetch per game_pk
     boxscores = {}
     async with httpx.AsyncClient(timeout=20) as client:
         for game_pk in {s.game_pk for s in snapshots}:
@@ -189,9 +248,8 @@ async def record_outcomes(db: Session, target_date: Optional[date] = None) -> di
 
         box = boxscores.get(snap.game_pk)
         if not box:
-            continue  # game not yet completed or fetch failed
+            continue
 
-        # Find the player's stats in the box
         outcome = _extract_player_outcome(box, snap.player_id, snap.prop_type)
         if outcome is None:
             continue
@@ -202,7 +260,7 @@ async def record_outcomes(db: Session, target_date: Optional[date] = None) -> di
             player_id=snap.player_id,
             prop_type=snap.prop_type,
             **outcome,
-            recorded_at=datetime.utcnow(),
+            recorded_at=datetime.now(timezone.utc),
         )
         db.merge(row)
         recorded += 1
@@ -213,7 +271,6 @@ async def record_outcomes(db: Session, target_date: Optional[date] = None) -> di
 
 
 def _extract_player_outcome(box: dict, player_id: int, prop_type: str) -> Optional[dict]:
-    """Find a player in a box score and return the outcome dict for the given prop type."""
     teams = box.get("teams", {})
     for side in ("home", "away"):
         players = teams.get(side, {}).get("players", {})

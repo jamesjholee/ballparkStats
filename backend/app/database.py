@@ -4,7 +4,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from app.models.db import Base
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./parkblast.db")
+import logging as _logging
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    _logging.warning(
+        "DATABASE_URL not set — falling back to local SQLite. "
+        "Set DATABASE_URL in production (Render environment variables panel)."
+    )
+    DATABASE_URL = "sqlite:///./parkblast.db"
 # Railway provides DATABASE_URL like postgres://... which SQLAlchemy 2.x needs as postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)

@@ -9,7 +9,119 @@ Three batter scores per matchup:
 Plus the supporting metrics: kHR, zone_fit, etc.
 """
 from typing import Optional
+import numpy as np
+import pandas as pd
 from app.constants import PARK_HR_FACTORS
+
+# ---------------------------------------------------------------------------
+# Kasper-alignment: mean-50 / sd-10 index weights (calibrated to 6/15 screenshots)
+# Run calibrate.fit_khr_weights() on full data to refine.
+# ---------------------------------------------------------------------------
+
+KHR_V2_WEIGHTS = {
+    "xwoba":       0.40,
+    "iso":         0.25,
+    "hh_percent":  0.20,
+    "brl_percent": 0.10,
+    "fb_percent":  0.05,
+}
+
+MATCHUP_KASPER_WEIGHTS = {
+    "khr":            0.40,
+    "zone_fit":       0.20,
+    "pitcher_vuln":   0.20,
+    "park_hr_factor": 0.12,
+    "environment":    0.08,
+}
+
+
+def _z_series(s: pd.Series) -> pd.Series:
+    """Z-score a Series robustly (zero-variance → zeros, NaN → zero)."""
+    s = pd.to_numeric(s, errors="coerce").fillna(s.mean() if not s.empty else 0)
+    sd = float(s.std(ddof=0))
+    if not sd or np.isnan(sd):
+        return pd.Series(0.0, index=s.index)
+    return (s - s.mean()) / sd
+
+
+def _weighted_z_df(df: pd.DataFrame, weights: dict) -> pd.Series:
+    """Weighted sum of per-column z-scores. Missing columns are skipped."""
+    total = pd.Series(0.0, index=df.index)
+    wsum = 0.0
+    for col, w in weights.items():
+        if col in df.columns:
+            total += w * _z_series(df[col])
+            wsum += w
+    return total / wsum if wsum else total
+
+
+def compute_khr_v2(df: pd.DataFrame) -> pd.Series:
+    """
+    kHR v2 — mean-50/sd-10 index over the multi-year MLB leaderboard.
+    Calibrated to Kasper's published values (r≈0.73, RMSE≈5.9).
+    Input df must have columns: xwoba, iso, hh_percent, brl_percent, fb_percent.
+    Returns a Series of kHR values on the same index.
+    """
+    return (50.0 + 10.0 * _weighted_z_df(df, KHR_V2_WEIGHTS)).round(3)
+
+
+def pitcher_vuln_raw(pitcher) -> float:
+    """
+    Raw pitcher HR vulnerability score.
+    Prefers multi-year leaderboard values (brl_allowed_rate, hh_allowed_rate);
+    falls back to 60-day pitch-level values. Z-scored across the slate in
+    compute_matchup_kasper so the absolute scale doesn't matter, only ranking.
+    """
+    if pitcher is None:
+        return 1.0
+    brl = (
+        pitcher.brl_allowed_rate
+        if getattr(pitcher, "brl_allowed_rate", None) is not None
+        else (getattr(pitcher, "barrel_per_bip", None) or 8.0)
+    )
+    hh = (
+        pitcher.hh_allowed_rate
+        if getattr(pitcher, "hh_allowed_rate", None) is not None
+        else 40.0
+    )
+    xwoba = getattr(pitcher, "xwoba_against", None) or 0.320
+    # Normalised to ~1.0 for a league-average pitcher
+    return 0.5 * (brl / 8.0) + 0.3 * (hh / 40.0) + 0.2 * (xwoba / 0.320)
+
+
+def compute_matchup_kasper(board: pd.DataFrame) -> pd.Series:
+    """
+    Kasper-style Matchup: 50 + 10 * weighted_z(components) over the slate.
+    Required columns: khr, zone_fit, pitcher_vuln, park_hr_factor, environment.
+    """
+    return (50.0 + 10.0 * _weighted_z_df(board, MATCHUP_KASPER_WEIGHTS)).round(3)
+
+
+def compute_test_score_kasper(board: pd.DataFrame) -> pd.Series:
+    """
+    Test Score: matchup with a mild sample-size haircut (~±2 of matchup,
+    matching Kasper's near-identical pair of columns).
+    """
+    matchup = compute_matchup_kasper(board)
+    tiers = board.get("sample_tier", pd.Series("thin", index=board.index))
+    haircut = (
+        tiers.map({"high": 1.000, "medium": 0.990, "thin": 0.975, "very_thin": 0.950})
+        .fillna(0.975)
+    )
+    return (matchup * haircut).round(3)
+
+
+def compute_ceiling_kasper(board: pd.DataFrame) -> pd.Series:
+    """
+    Ceiling: Matchup pushed by air-power (FB% + max EV upside), clipped so it
+    can't exceed the natural 50+10*z range by more than a few points.
+    """
+    base = compute_matchup_kasper(board)
+    fb_z = _z_series(board.get("fb_percent", pd.Series(25.0, index=board.index)))
+    ev_z = _z_series(board.get("avg_hit_speed", pd.Series(88.0, index=board.index)))
+    upside = (fb_z + ev_z).clip(lower=0)
+    return (base + 6.0 * upside).round(3)
+
 
 WEIGHTS = {
     "barrel": 22,

@@ -10,7 +10,7 @@ GET /api/backtest/component/{component}?days=30
 """
 from datetime import date, timedelta
 from typing import Optional
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -26,7 +26,7 @@ VALID_COMPONENTS = {"matchup_score", "test_score", "ceiling", "zone_fit",
 @router.get("/api/backtest/summary")
 def backtest_summary(
     days: int = Query(30, ge=1, le=365),
-    prop_type: str = Query("hr"),
+    prop_type: str = Query("hr", pattern="^(hr|k)$"),
     db: Session = Depends(get_db),
 ):
     """
@@ -100,7 +100,7 @@ def backtest_component(
     component: str,
     days: int = Query(30, ge=1, le=365),
     bucket_size: int = Query(10, ge=5, le=25),
-    prop_type: str = Query("hr"),
+    prop_type: str = Query("hr", pattern="^(hr|k)$"),
     db: Session = Depends(get_db),
 ):
     """
@@ -109,7 +109,7 @@ def backtest_component(
     Tells you whether the component is actually predictive.
     """
     if component not in VALID_COMPONENTS:
-        return {"error": f"unknown component. Valid: {sorted(VALID_COMPONENTS)}"}
+        raise HTTPException(status_code=400, detail=f"unknown component. Valid: {sorted(VALID_COMPONENTS)}")
 
     cutoff = date.today() - timedelta(days=days)
     rows = (
@@ -165,7 +165,7 @@ def backtest_component(
 @router.get("/api/backtest/log")
 def backtest_log(
     days: int = Query(7, ge=1, le=30),
-    prop_type: str = Query("hr"),
+    prop_type: str = Query("hr", pattern="^(hr|k)$"),
     db: Session = Depends(get_db),
 ):
     """

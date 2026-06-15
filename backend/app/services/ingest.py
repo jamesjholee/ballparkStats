@@ -31,6 +31,22 @@ from app.services.scoring import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Multi-year baseline config (Task 1)
+# ---------------------------------------------------------------------------
+SEASON = int(os.getenv("SEASON", "2026"))
+WINDOW_YEARS = int(os.getenv("WINDOW_YEARS", "6"))
+YEARS = list(range(SEASON - WINDOW_YEARS + 1, SEASON + 1))  # e.g. 2021-2026
+
+# HR Form mode: "percentile" (league pull, heavy) or "baseline_ratio" (fast, default)
+FORM_MODE = os.getenv("FORM_MODE", "baseline_ratio")
+FORM_WINDOW_DAYS = int(os.getenv("FORM_WINDOW_DAYS", "21"))
+
+# Module-level cache keyed by date — rebuilt once per cron run
+_LEADERBOARD_CACHE: dict = {}
+_LEADERBOARD_CACHE_DATE = None
+_LEAGUE_FORM_CACHE: dict = {}
+
 
 def _py(v):
     """
@@ -66,6 +82,287 @@ def _py(v):
 
 # Without this, you'll get rate-limited by Baseball Savant within minutes.
 pybaseball.cache.enable()
+
+# ---------------------------------------------------------------------------
+# Multi-year leaderboard helpers (Task 1)
+# ---------------------------------------------------------------------------
+
+def _agg_years(fetch, years, key, weight_col, rate_cols, sum_cols) -> pd.DataFrame:
+    """
+    Call fetch(year) for each year in years, aggregate per `key`:
+      rate_cols  → sample-weighted mean (weight = weight_col)
+      sum_cols   → sum across years
+    Years that fail or return empty are skipped silently.
+    """
+    frames = []
+    for y in years:
+        try:
+            df = fetch(y)
+            if df is not None and not df.empty and key in df.columns:
+                df = df.copy()
+                df["_yr"] = y
+                frames.append(df)
+        except Exception as exc:
+            logger.debug(f"_agg_years year={y} skip: {exc}")
+        time.sleep(0.4)
+    if not frames:
+        return pd.DataFrame()
+
+    allf = pd.concat(frames, ignore_index=True)
+    allf[weight_col] = pd.to_numeric(allf[weight_col], errors="coerce").fillna(0)
+
+    rows = []
+    for k, g in allf.groupby(key):
+        row: dict = {key: k}
+        w = g[weight_col]
+        wsum = float(w.sum())
+        for c in rate_cols:
+            if c in g.columns and wsum > 0:
+                vals = pd.to_numeric(g[c], errors="coerce")
+                row[c] = float(np.nansum(vals * w) / wsum)
+            else:
+                row[c] = np.nan
+        for c in sum_cols:
+            if c in g.columns:
+                row[c] = float(pd.to_numeric(g[c], errors="coerce").fillna(0).sum())
+        # carry representative name fields
+        for nm in ("first_name", "last_name"):
+            if nm in g.columns:
+                row[nm] = g[nm].iloc[-1]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _agg_arsenal(fetch, years) -> pd.DataFrame:
+    """Aggregate a per-pitch-type arsenal table across years, weighted by pitches."""
+    frames = []
+    for y in years:
+        try:
+            df = fetch(y, minPA=10)
+            if df is not None and not df.empty:
+                frames.append(df.copy())
+        except Exception as exc:
+            logger.debug(f"_agg_arsenal year={y} skip: {exc}")
+        time.sleep(0.4)
+    if not frames:
+        return pd.DataFrame()
+
+    allf = pd.concat(frames, ignore_index=True)
+    wcol = "pitches" if "pitches" in allf.columns else None
+    if wcol is None:
+        return allf
+
+    allf[wcol] = pd.to_numeric(allf[wcol], errors="coerce").fillna(0)
+    rate_cols = [c for c in ("est_woba", "woba", "hard_hit_percent", "pitch_usage",
+                             "whiff_percent") if c in allf.columns]
+    rows = []
+    for (pid, pt), g in allf.groupby(["player_id", "pitch_type"]):
+        w = g[wcol]
+        wsum = float(w.sum())
+        row = {"player_id": pid, "pitch_type": pt, "pitches": wsum}
+        for c in rate_cols:
+            vals = pd.to_numeric(g[c], errors="coerce")
+            row[c] = float(np.nansum(vals * w) / wsum) if wsum else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _build_fg_id_map(fg_df: pd.DataFrame) -> dict:
+    """
+    Map FanGraphs playerid (IDfg) → mlbam id.
+    Fixes the accented/suffixed name join bug (Marchán, Jr., etc.).
+    """
+    id_col = next((c for c in ("playerid", "IDfg", "xMLBAMID") if c in fg_df.columns), None)
+    if id_col is None:
+        return {}
+    fg_ids = fg_df[id_col].dropna().astype(int).unique().tolist()
+    if not fg_ids:
+        return {}
+    try:
+        time.sleep(0.4)
+        mapping = pybaseball.playerid_reverse_lookup(fg_ids, name_key="fangraphs")
+        return {
+            int(r["key_fangraphs"]): int(r["key_mlbam"])
+            for _, r in mapping.iterrows()
+            if pd.notna(r.get("key_fangraphs")) and pd.notna(r.get("key_mlbam"))
+        }
+    except Exception as exc:
+        logger.warning(f"playerid_reverse_lookup failed: {exc}")
+        return {}
+
+
+def build_season_leaderboards(years=None) -> dict:
+    """
+    Build multi-year aggregated leaderboard tables (once per cron day).
+    Returns {'batters': DataFrame, 'pitchers': DataFrame}.
+    Batters table includes a 'khr_v2' column (50/10 index across all MLB players).
+    """
+    global _LEADERBOARD_CACHE, _LEADERBOARD_CACHE_DATE
+    today = date.today()
+    if _LEADERBOARD_CACHE_DATE == today and _LEADERBOARD_CACHE:
+        return _LEADERBOARD_CACHE
+
+    yrs = tuple(years or YEARS)
+    logger.info(f"Building {len(yrs)}-year leaderboards ({yrs[0]}-{yrs[-1]})…")
+
+    # --- Batter exit-velo/barrel leaderboard ---
+    ev = _agg_years(
+        lambda y: pybaseball.statcast_batter_exitvelo_barrels(y, minBBE=50).rename(
+            columns={"ev95percent": "hh_percent",
+                     "anglesweetspotpercent": "sweetspot_percent",
+                     "avg_hit_angle": "la"}),
+        yrs, key="player_id", weight_col="attempts",
+        rate_cols=["brl_percent", "hh_percent", "sweetspot_percent", "la", "avg_hit_speed"],
+        sum_cols=["attempts"])
+
+    # --- Batter expected-stats leaderboard ---
+    xw = _agg_years(
+        lambda y: pybaseball.statcast_batter_expected_stats(y, minPA=50).rename(
+            columns={"est_woba": "xwoba"}),
+        yrs, key="player_id", weight_col="pa",
+        rate_cols=["xwoba"], sum_cols=["pa", "bip"])
+
+    # --- FanGraphs multi-year aggregate (ISO, FB%, SwStr%) ---
+    fg = pd.DataFrame(columns=["player_id", "iso", "fb_percent", "swstr_percent"])
+    try:
+        fg_raw = pybaseball.batting_stats(int(yrs[0]), int(yrs[-1]), qual=50, ind=0)
+        fg_raw = fg_raw.rename(columns={
+            "ISO": "iso", "FB%": "fb_percent", "SwStr%": "swstr_percent"})
+        fg_id_map = _build_fg_id_map(fg_raw)
+        id_col = next((c for c in ("playerid", "IDfg") if c in fg_raw.columns), None)
+        if id_col and fg_id_map:
+            fg_raw["player_id"] = fg_raw[id_col].map(
+                lambda x: fg_id_map.get(int(x)) if pd.notna(x) else None)
+            fg = (fg_raw[fg_raw["player_id"].notna()]
+                  [["player_id", "iso", "fb_percent", "swstr_percent"]]
+                  .copy())
+            fg["player_id"] = fg["player_id"].astype(int)
+    except Exception as exc:
+        logger.warning(f"FanGraphs leaderboard failed: {exc}")
+
+    # Merge batter tables
+    batters = ev.merge(
+        xw[["player_id", "xwoba", "pa", "bip"]], on="player_id", how="left")
+    batters = batters.merge(fg, on="player_id", how="left")
+
+    # Compute kHR v2 across the full leaderboard (stable MLB-wide index)
+    from app.services.scoring import compute_khr_v2
+    batters["khr_v2"] = compute_khr_v2(batters).values
+
+    # --- Pitcher vulnerability leaderboard ---
+    p_ev = _agg_years(
+        lambda y: pybaseball.statcast_pitcher_exitvelo_barrels(y, minBBE=30).rename(
+            columns={"brl_percent": "brl_allowed_rate", "ev95percent": "hh_allowed_rate"}),
+        yrs, key="player_id", weight_col="attempts",
+        rate_cols=["brl_allowed_rate", "hh_allowed_rate"], sum_cols=["attempts"])
+
+    p_xw = _agg_years(
+        lambda y: pybaseball.statcast_pitcher_expected_stats(y, minPA=30).rename(
+            columns={"est_woba": "xwoba_allowed"}),
+        yrs, key="player_id", weight_col="pa",
+        rate_cols=["xwoba_allowed"], sum_cols=["pa"])
+
+    pitchers = p_ev.merge(
+        p_xw[["player_id", "xwoba_allowed"]] if not p_xw.empty else pd.DataFrame(columns=["player_id"]),
+        on="player_id", how="left")
+
+    _LEADERBOARD_CACHE = {"batters": batters, "pitchers": pitchers}
+    _LEADERBOARD_CACHE_DATE = today
+    logger.info(
+        f"Leaderboards built: {len(batters)} batters, {len(pitchers)} pitchers")
+    return _LEADERBOARD_CACHE
+
+
+# ---------------------------------------------------------------------------
+# Kasper-style HR Form helpers (Task 3)
+# ---------------------------------------------------------------------------
+
+def _compute_power_composite(bbe: pd.DataFrame) -> float:
+    """
+    Recent-power composite: barrel_rate*0.40 + xwobacon*0.30 +
+    hardhit_rate*0.20 + avg_ev/100*0.10.
+    Returns NaN when bbe is empty.
+    """
+    if bbe is None or bbe.empty:
+        return np.nan
+    n = len(bbe)
+    barrel = (
+        float(bbe["launch_speed_angle"].eq(6).sum() / n)
+        if "launch_speed_angle" in bbe.columns else np.nan)
+    hh = (
+        float((bbe["launch_speed"] >= 95).sum() / n)
+        if "launch_speed" in bbe.columns else np.nan)
+    ev = (
+        float(bbe["launch_speed"].mean() / 100.0)
+        if "launch_speed" in bbe.columns else np.nan)
+    xwobacon = (
+        float(pd.to_numeric(bbe["estimated_woba_using_speedangle"],
+                            errors="coerce").mean())
+        if "estimated_woba_using_speedangle" in bbe.columns else np.nan)
+
+    weights = {"barrel_rate": 0.40, "xwobacon": 0.30, "hardhit_rate": 0.20, "avg_ev": 0.10}
+    parts = {"barrel_rate": barrel, "xwobacon": xwobacon, "hardhit_rate": hh, "avg_ev": ev}
+    num = sum(weights[k] * v for k, v in parts.items() if pd.notna(v))
+    den = sum(weights[k] for k, v in parts.items() if pd.notna(v))
+    return num / den if den else np.nan
+
+
+def _hr_form_kasper(
+    df: pd.DataFrame,
+    league_ref: Optional[np.ndarray] = None,
+    window_days: Optional[int] = None,
+    asof: Optional[date] = None,
+) -> tuple:
+    """
+    Kasper-style HR Form: (form_pct, arrow).
+    percentile mode: form_pct = % of league below this hitter's recent composite.
+    baseline_ratio mode (default): recent composite / full-window composite → %.
+    Arrow: sign(last-7d composite − prior-14d composite), thresholds ±5%.
+    """
+    window = window_days or FORM_WINDOW_DAYS
+    bbe = df[df["type"] == "X"].copy()
+    if bbe.empty:
+        return None, "flat"
+
+    bbe["game_date"] = pd.to_datetime(bbe["game_date"])
+    asof_dt = pd.to_datetime(asof or date.today())
+    cutoff = asof_dt - pd.Timedelta(days=window)
+    recent_bbe = bbe[bbe["game_date"] >= cutoff]
+
+    if recent_bbe.empty:
+        return None, "flat"
+
+    comp = _compute_power_composite(recent_bbe)
+
+    if FORM_MODE == "percentile" and league_ref is not None and len(league_ref) > 0 and not np.isnan(comp):
+        form_pct = float((league_ref < comp).mean() * 100)
+    else:
+        baseline_comp = _compute_power_composite(bbe)
+        if pd.isna(baseline_comp) or baseline_comp == 0 or pd.isna(comp):
+            form_pct = 50.0
+        else:
+            ratio = comp / baseline_comp
+            form_pct = float(100.0 * ratio / (ratio + 1.0))
+
+    # Arrow: last 7d vs prior 14d within the window
+    cutoff_short = asof_dt - pd.Timedelta(days=7)
+    short_bbe = bbe[bbe["game_date"] >= cutoff_short]
+    prior_bbe = bbe[
+        (bbe["game_date"] >= cutoff) & (bbe["game_date"] < cutoff_short)]
+
+    short_comp = _compute_power_composite(short_bbe) if not short_bbe.empty else np.nan
+    prior_comp = _compute_power_composite(prior_bbe) if not prior_bbe.empty else np.nan
+
+    if pd.isna(short_comp) or pd.isna(prior_comp) or prior_comp == 0:
+        arrow = "flat"
+    elif short_comp > prior_comp * 1.05:
+        arrow = "up"
+    elif short_comp < prior_comp * 0.95:
+        arrow = "down"
+    else:
+        arrow = "flat"
+
+    return (round(form_pct, 1) if not np.isnan(form_pct) else None), arrow
 
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
 
@@ -572,7 +869,12 @@ def fetch_season_baseline(mlbam_id: int) -> Optional[dict]:
     return _bbe_metrics(bbe)
 
 
-def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
+def refresh_batter_stats(
+    db: Session,
+    mlbam_id: int,
+    leaderboard: Optional[dict] = None,
+    league_form_ref: Optional[np.ndarray] = None,
+) -> Optional[BatterStats]:
     """Pull rolling lookback window for a batter, compute the full Kasper stat set."""
     end = date.today()
     start = _lookback_start(end)
@@ -721,15 +1023,50 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
 
         form_v2 = compute_form_v2(recent_metrics, baseline_metrics, baseline_source)
 
+    # --- Multi-year leaderboard enrichment (Task 1 + 2) ---
+    lb_row = None
+    if leaderboard and "batters" in leaderboard:
+        bt = leaderboard["batters"]
+        match = bt[bt["player_id"] == mlbam_id]
+        if not match.empty:
+            lb_row = match.iloc[0]
+
+    if lb_row is not None:
+        iso_final      = _py(float(lb_row["iso"])) if pd.notna(lb_row.get("iso")) else _py(round(float(iso), 3))
+        xwoba_final    = _py(float(lb_row["xwoba"])) if pd.notna(lb_row.get("xwoba")) else (_py(round(float(xwoba), 3)) if not pd.isna(xwoba) else 0)
+        fb_pct_final   = _py(float(lb_row["fb_percent"])) if pd.notna(lb_row.get("fb_percent")) else None
+        hh_final       = _py(float(lb_row["hh_percent"])) if pd.notna(lb_row.get("hh_percent")) else _py(round(hard_hit_pct, 1))
+        brl_final      = _py(float(lb_row["brl_percent"])) if pd.notna(lb_row.get("brl_percent")) else _py(round(barrel_pct, 1))
+        khr_final      = _py(float(lb_row["khr_v2"])) if pd.notna(lb_row.get("khr_v2")) else _py(round(khr, 1))
+        pitches_final  = _py(int(lb_row["attempts"])) if pd.notna(lb_row.get("attempts")) else _py(pitches)
+        bip_final      = _py(int(lb_row["bip"])) if pd.notna(lb_row.get("bip")) else _py(n_bbe)
+    else:
+        iso_final      = _py(round(float(iso), 3))
+        xwoba_final    = _py(round(float(xwoba), 3)) if not pd.isna(xwoba) else 0
+        fb_pct_final   = None
+        hh_final       = _py(round(hard_hit_pct, 1))
+        brl_final      = _py(round(barrel_pct, 1))
+        khr_final      = _py(round(khr, 1))
+        pitches_final  = _py(pitches)
+        bip_final      = _py(n_bbe)
+
+    # Sample tier uses leaderboard career counts when available (career-scale = correct)
+    sample_tier = compute_sample_tier(pitches_final, bip_final)
+
+    # Kasper-style HR Form (Task 3) — short-window BBE, not multi-year
+    kasper_pct, kasper_arrow = _hr_form_kasper(df, league_ref=league_form_ref)
+
     stats = BatterStats(
         mlbam_id=mlbam_id,
         as_of=end,
-        pitches=_py(pitches),
-        bip=_py(n_bbe),
+        # Use leaderboard career counts when available (Task 1)
+        pitches=pitches_final,
+        bip=bip_final,
         pa=_py(pa),
         sample_tier=sample_tier,
-        barrel_rate=_py(round(barrel_pct, 1)),
-        hard_hit_rate=_py(round(hard_hit_pct, 1)),
+        # Core rates — prefer leaderboard for kHR inputs (Task 1)
+        barrel_rate=brl_final,
+        hard_hit_rate=hh_final,
         sweet_spot_rate=_py(round(sweet_spot_pct, 1)),
         avg_exit_velo=_py(round(bbe["launch_speed"].mean(), 1)) if n_bbe else 0,
         max_exit_velo=_py(round(bbe["launch_speed"].max(), 1)) if n_bbe else 0,
@@ -737,21 +1074,29 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
         bat_speed=_py(round(float(bat_speed), 1)),
         pulled_barrel_rate=_py(round(pulled_barrel_pct, 1)),
         swstr_rate=_py(round(swstr_pct, 1)),
-        iso=_py(round(float(iso), 3)),
-        xwoba=_py(round(float(xwoba), 3)) if not pd.isna(xwoba) else 0,
+        # Expected stats — prefer leaderboard (Task 1)
+        iso=iso_final,
+        xwoba=xwoba_final,
         xwoba_con=_py(round(float(xwoba_con), 3)) if not pd.isna(xwoba_con) else 0,
+        # kHR v2 from leaderboard-wide z-score (Task 2)
         hr_total=_py(len(hrs)),
-        khr=_py(round(khr, 1)),
+        khr=khr_final,
+        # Multi-year leaderboard extras
+        fb_percent=fb_pct_final,
+        # Zone data (still short-window; needed for zone_fit)
         hot_zones=_py(_hot_zones(df)),
         woba_zones=_py(woba_zones),
         z_swing_rate=_py(z_swing_rate),
         o_swing_rate=_py(o_swing_rate),
-        # Form v2
+        # Form v2 (Task 3 — kept as internal signal)
         form_score=_py(form_v2["form_score"]),
         form_arrow=form_v2["form_arrow"],
         form_breakdown=_py(form_v2["form_breakdown"]),
         baseline_source=form_v2["baseline_source"],
-        # Legacy form fields (still populated for backwards compat)
+        # Kasper-style HR Form displayed column (Task 3)
+        hr_form_kasper_pct=_py(kasper_pct),
+        hr_form_kasper_arrow=kasper_arrow,
+        # Legacy form fields (kept for backwards compat)
         hr_l7=_py(_hrs_in_window(7)),
         hr_l15=_py(_hrs_in_window(15)),
         hr_l30=_py(_hrs_in_window(30)),
@@ -763,7 +1108,11 @@ def refresh_batter_stats(db: Session, mlbam_id: int) -> Optional[BatterStats]:
     return stats
 
 
-def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
+def refresh_pitcher_stats(
+    db: Session,
+    mlbam_id: int,
+    pitcher_leaderboard: Optional[dict] = None,
+) -> Optional[PitcherStats]:
     end = date.today()
     start = _lookback_start(end)
     try:
@@ -839,6 +1188,23 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
     _throws_vals = df["p_throws"].dropna()
     throws = str(_throws_vals.iloc[0]) if len(_throws_vals) else "R"
 
+    # Multi-year pitcher vulnerability from leaderboard (Task 4)
+    p_lb_row = None
+    if pitcher_leaderboard and "pitchers" in pitcher_leaderboard:
+        pt = pitcher_leaderboard["pitchers"]
+        match = pt[pt["player_id"] == mlbam_id]
+        if not match.empty:
+            p_lb_row = match.iloc[0]
+
+    brl_allowed = (
+        _py(float(p_lb_row["brl_allowed_rate"]))
+        if p_lb_row is not None and pd.notna(p_lb_row.get("brl_allowed_rate"))
+        else None)
+    hh_allowed = (
+        _py(float(p_lb_row["hh_allowed_rate"]))
+        if p_lb_row is not None and pd.notna(p_lb_row.get("hh_allowed_rate"))
+        else None)
+
     stats = PitcherStats(
         mlbam_id=mlbam_id,
         as_of=end,
@@ -862,6 +1228,9 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
         zone_profile_by_pitch_type=_py(zone_by_type),
         edge_pct=_py(edge_pct),
         heart_pct=_py(heart_pct),
+        # Multi-year vulnerability (Task 4)
+        brl_allowed_rate=brl_allowed,
+        hh_allowed_rate=hh_allowed,
     )
     db.merge(stats)
     db.commit()
@@ -874,6 +1243,13 @@ def refresh_pitcher_stats(db: Session, mlbam_id: int) -> Optional[PitcherStats]:
 
 
 async def run_daily_refresh(db: Session):
+    # Build multi-year leaderboards once for the whole cron run (Task 1)
+    leaderboard = {}
+    try:
+        leaderboard = build_season_leaderboards()
+    except Exception:
+        logger.exception("build_season_leaderboards failed — falling back to short-window only")
+
     games = await fetch_todays_games()
     logger.info(f"Found {len(games)} games today")
 
@@ -973,7 +1349,7 @@ async def run_daily_refresh(db: Session):
     total_batters = len(all_batter_ids)
     for i, bid in enumerate(all_batter_ids, 1):
         try:
-            result = refresh_batter_stats(db, bid)
+            result = refresh_batter_stats(db, bid, leaderboard=leaderboard)
             if result is not None:
                 n_batter_ok += 1
         except Exception:
@@ -993,7 +1369,7 @@ async def run_daily_refresh(db: Session):
     total_pitchers = len(all_pitcher_ids)
     for i, pid in enumerate(all_pitcher_ids, 1):
         try:
-            result = refresh_pitcher_stats(db, pid)
+            result = refresh_pitcher_stats(db, pid, pitcher_leaderboard=leaderboard)
             if result is not None:
                 n_pitcher_ok += 1
         except Exception:

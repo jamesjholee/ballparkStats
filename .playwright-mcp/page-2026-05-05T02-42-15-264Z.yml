@@ -1,0 +1,13 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: ▌ PARKBLAST
+      - heading "Daily HR & K Intelligence" [level=1] [ref=e7]
+    - navigation [ref=e8]:
+      - button "GAMES" [ref=e9] [cursor=pointer]
+      - button "PITCHERS" [ref=e10] [cursor=pointer]
+      - button "BACKTEST" [ref=e11] [cursor=pointer]
+  - generic [ref=e12]:
+    - img [ref=e13]
+    - generic [ref=e15]: Loading slate...
+  - contentinfo [ref=e16]: PARKBLAST · v0.2 · for entertainment purposes only · 21+ · cross-reference with PropFinder

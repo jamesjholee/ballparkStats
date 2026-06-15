@@ -3,7 +3,11 @@ SQLAlchemy models — Postgres schema for cached data.
 Extended to match Kasper-style column set.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
 
 from sqlalchemy import (
     JSON,
@@ -29,7 +33,7 @@ class Player(Base):
     position = Column(String(4))
     bats = Column(String(2))
     throws = Column(String(2))
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=_utcnow)
 
 
 class BatterStats(Base):
@@ -73,6 +77,9 @@ class BatterStats(Base):
     z_swing_rate = Column(Float)  # in-zone swing rate
     o_swing_rate = Column(Float)  # chase rate (out-of-zone swing)
 
+    # Multi-year leaderboard stats (FanGraphs, aggregated over WINDOW_YEARS)
+    fb_percent = Column(Float)  # FB% from FanGraphs leaderboard
+
     # Form v2 — multi-component "is this batter hot?" analysis
     # Recent window = last ~25 batted balls in play
     # Baseline = full-season (when ≥50 BBE) else prior 20 days
@@ -80,6 +87,10 @@ class BatterStats(Base):
     form_arrow = Column(String(8))  # "up" | "down" | "flat"
     form_breakdown = Column(JSON)  # per-component scores for explainability
     baseline_source = Column(String(8))  # "season" | "prior" | "none"
+
+    # Kasper-style HR Form (recent power composite vs league percentile + arrow)
+    hr_form_kasper_pct = Column(Float)  # 0-100 percentile (displayed "HR Form" column)
+    hr_form_kasper_arrow = Column(String(8))  # "up" | "down" | "flat"
 
     # Form
     hr_l7 = Column(Integer, default=0)
@@ -128,6 +139,10 @@ class PitcherStats(Base):
     edge_pct = Column(Float)  # % pitches on edges (corners + just-off-plate)
     heart_pct = Column(Float)  # % pitches in zone 5 (middle-middle)
 
+    # Multi-year leaderboard vulnerability (feeds pitcher_vuln in Kasper matchup)
+    brl_allowed_rate = Column(Float)  # multi-year Brl/BIP% allowed
+    hh_allowed_rate = Column(Float)   # multi-year HH% allowed
+
 
 class Game(Base):
     __tablename__ = "games"
@@ -159,7 +174,7 @@ class HRPropOdds(Base):
     book = Column(String, primary_key=True)
     odds_american = Column(Integer)
     implied_prob = Column(Float)
-    fetched_at = Column(DateTime, default=datetime.utcnow)
+    fetched_at = Column(DateTime, default=_utcnow)
 
 
 class PickSnapshot(Base):
@@ -204,7 +219,7 @@ class PickSnapshot(Base):
     odds_american = Column(Integer, nullable=True)
     implied_prob = Column(Float, nullable=True)
 
-    snapshot_at = Column(DateTime, default=datetime.utcnow)
+    snapshot_at = Column(DateTime, default=_utcnow)
 
 
 class PickOutcome(Base):
@@ -227,7 +242,7 @@ class PickOutcome(Base):
 
     # Context
     game_status = Column(String)  # "completed" | "postponed" | "did_not_play"
-    recorded_at = Column(DateTime, default=datetime.utcnow)
+    recorded_at = Column(DateTime, default=_utcnow)
 
 
 Index("ix_lineups_game", Lineup.game_pk)
